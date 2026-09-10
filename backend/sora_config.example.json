@@ -1,0 +1,8 @@
+{
+  "secret": "REPLACE_GENERATE_YOUR_OWN_LONG_RANDOM_HEX",
+  "worker_base": "https://your-worker.example.com",
+  "snail_api_key": "sk-your-own-key",
+  "snail_api_base": "http://127.0.0.1:8900",
+  "snail_model": "your-model",
+  "render_slots": 1
+}
