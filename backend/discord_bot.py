@@ -455,7 +455,7 @@ class SnoraClient(discord.Client):
 
     # ---- the pipeline ----
 
-    async def handle_ask(self, ch, user, text, ack, attachments=()):
+    async def handle_ask(self, ch, user, text, ack, attachments=(), end_image=None):
         # nanny layer first — some asks should die before costing a token
         blocked = nanny_check(text, getattr(getattr(ch, "guild", None), "id", None),
                               getattr(user, "id", None))
@@ -551,6 +551,15 @@ class SnoraClient(discord.Client):
             return await ack.edit(
                 content="🎙️ A voice needs a face to ride on — send a photo with it, or name "
                         "a library reference by name so I know who's talking.")
+        # begin→end: an explicit ending picture (slash /video ending=), or the
+        # mention-flow keyword rule: attach 2+ photos and say "ending frame"
+        # (or "last photo is the ending" / "ends with the last photo") and the
+        # LAST photo becomes the final frame of the clip.
+        if end_image is None and imgs:
+            if re.search(r"\b(end(ing)? frame|last (photo|picture|image) (is|as|to be) "
+                         r"(the )?end(ing)?|ends? with (the )?last (photo|picture|image))\b",
+                         text, re.I) and len(imgs) >= 2:
+                end_image = imgs.pop()
         # 2. queue it on the farm
         payload = {k: plan[k] for k in ("prompt", "quality", "aspect", "duration", "ref_mode")}
         payload["await_approval"] = bool(CFG["await_approval"])
@@ -559,6 +568,12 @@ class SnoraClient(discord.Client):
             payload["image_key"] = plan["image"]  # farm re-validates against the manifest
         if imgs:
             payload["images"] = imgs
+        if end_image:
+            if not imgs:
+                return await ack.edit(content="🎬 An ending frame needs a beginning frame "
+                                              "too — attach the starting photo as well.")
+            payload["end_image"] = end_image
+            payload["aspect"] = "auto"
         if voice:
             payload["voice"] = voice
         try:
@@ -753,8 +768,13 @@ class SnoraClient(discord.Client):
 
     def build_commands(self):
         @self.tree.command(name="video", description="Generate a video with the sNora render farm")
-        @discord.app_commands.describe(idea="What should happen in the clip")
-        async def _video(interaction: discord.Interaction, idea: str):
+        @discord.app_commands.describe(
+            idea="What should happen in the clip",
+            photo="Optional starting frame",
+            ending="Optional ending frame — the clip morphs photo → ending")
+        async def _video(interaction: discord.Interaction, idea: str,
+                         photo: discord.Attachment = None,
+                         ending: discord.Attachment = None):
             if not self.allowed(interaction.channel):
                 await interaction.response.send_message("I don't work in this channel.", ephemeral=True)
                 return
@@ -763,9 +783,31 @@ class SnoraClient(discord.Client):
                 await interaction.response.send_message("You already have a clip in the pipeline.",
                                                         ephemeral=True)
                 return
+            atts = [a for a in (photo,) if a is not None]
+            end_image = None
+            if ending is not None:
+                try:
+                    raw = await ending.read()
+                    import io as _io
+                    from PIL import Image
+                    import pillow_heif
+                    pillow_heif.register_heif_opener()
+                    im = Image.open(_io.BytesIO(raw)).convert("RGB")
+                    im.thumbnail((1536, 1536))
+                    _buf = _io.BytesIO()
+                    im.save(_buf, "JPEG", quality=88)
+                    import base64 as _b64
+                    end_image = ("data:image/jpg;base64,"
+                                 + _b64.b64encode(_buf.getvalue()).decode())
+                except Exception:
+                    log.exception("slash ending attachment failed")
+                    return await interaction.response.send_message(
+                        "⚠️ Couldn't read that ending picture — try an attached JPG/PNG.",
+                        ephemeral=True)
             await interaction.response.send_message("🎬 On it — writing your shot…")
             ack = await interaction.original_response()
-            await self.handle_ask(interaction.channel, interaction.user, idea, ack)
+            await self.handle_ask(interaction.channel, interaction.user, idea, ack,
+                                  atts, end_image)
 
 
 async def main():

@@ -326,6 +326,9 @@ struct JobRow: View {
                 if job.has_voice == true {
                     MetaIcon(system: "mic.fill")
                 }
+                if job.has_end == true {
+                    MetaTag(text: "BEGIN\u{2192}END")
+                }
                 if let q = job.quality {
                     MetaTag(text: q.uppercased())
                 }

@@ -132,6 +132,16 @@ The mode needs one extra pipeline file on the farm: copy
 `load-image` stage wired to the final frame). Without it the job fails with a
 vpipe stage error, and everything else is unaffected.
 
+Users reach it three ways out of the box:
+
+* **Discord** — `/video` takes optional `photo` (starting frame) and `ending`
+  (final frame) attachments; in a plain `@sNora` message, attach 2+ photos and
+  say "ending frame" (or "last photo is the ending") and the last photo closes
+  the clip.
+* **iOS app** — with 2+ reference photos, a "last photo is the ending frame"
+  toggle appears; jobs show a `BEGIN→END` chip.
+* **API** — `end_image` / `end_image_key` on `POST /jobs` (above).
+
 ## Live progress, ETA, and the phone viewer
 
 While a job is `rendering`, `/jobs` and `/jobs/<id>` include:

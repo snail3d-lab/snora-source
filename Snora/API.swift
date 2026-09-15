@@ -181,7 +181,8 @@ enum API {
     }
 
     static func submit(token: String, prompt: String, quality: String, aspect: String, duration: Int,
-                       photos: [UIImage], voiceURL: URL?, refMode: String) async throws -> Job
+                       photos: [UIImage], endingPhoto: UIImage? = nil,
+                       voiceURL: URL?, refMode: String) async throws -> Job
     {
         var req = URLRequest(url: URL(string: base)!)
         req.httpMethod = "POST"

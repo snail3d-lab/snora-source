@@ -10,6 +10,7 @@ struct CreateView: View {
     @State private var aspect = "wide"
     @State private var duration = 5
     @State private var photos: [UIImage] = []
+    @State private var lastIsEnding = false
     @State private var refMode = "scene"
     @State private var voiceURL: URL?
     @State private var voiceLabel = ""
@@ -174,6 +175,15 @@ struct CreateView: View {
                 }
                 .buttonStyle(GhostButtonStyle())
                 .disabled(photos.count >= maxPhotos)
+            }
+            if photos.count >= 2 {
+                Toggle(isOn: $lastIsEnding) {
+                    Text(lastIsEnding
+                         ? "begin\u{2192}end \u{2014} photo 1 opens the clip, the last photo closes it (photos between are ignored)"
+                         : "last photo is the ending frame")
+                        .font(.footnote).foregroundStyle(Theme.sand)
+                }
+                .tint(Theme.signal)
             }
         }
     }
@@ -592,11 +602,15 @@ struct CreateView: View {
         busy = true
         Task {
             do {
+                let useEnding = lastIsEnding && photos.count >= 2
                 _ = try await API.submit(token: token, prompt: prompt, quality: quality,
                                          aspect: aspect, duration: duration,
-                                         photos: photos, voiceURL: voiceURL, refMode: refMode)
+                                         photos: useEnding ? Array(photos.dropLast()) : photos,
+                                         endingPhoto: useEnding ? photos.last : nil,
+                                         voiceURL: voiceURL, refMode: refMode)
                 msg = "submitted — we'll ping you when it's ready"
                 prompt = ""
+                lastIsEnding = false
             } catch let e as URLError where e.localizedDescription.contains("renders in progress") || e.localizedDescription.contains("queue") {
                 msg = e.localizedDescription
             } catch let e as SubmitError {
