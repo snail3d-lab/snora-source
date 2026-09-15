@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""sNora render service — public video generation for snail3d.com.
+"""sNora render service — public video generation backend.
 
-Bridges the Cloudflare worker (public API on snail3d.com) to the local render
-farm. Pure stdlib; runs under launchd on :7789, exposed publicly via the
-cloudflared tunnel (sora.snail3d.com).
+Bridges a public Cloudflare worker (or any front-end) to the local render
+farm. Pure stdlib; runs under a service manager on :7789, exposed publicly
+via your tunnel of choice.
 
 Endpoints:
   GET  /health      -> {"ok": true}            (no auth — for tunnel checks)
@@ -53,7 +53,7 @@ HOME = os.path.expanduser("~")
 CONFIG = {
     "port": 7789,
     "secret": os.environ.get("SORA_SECRET", ""),
-    "worker_base": "https://snail3d.com",
+    "worker_base": "https://your-frontend.example.com",
     "backend": "vpipe",
     # vpipe backend
     "vpipe_bin": "/Applications/Vpipe Manager.app/Contents/Helpers/vpipe",
@@ -207,6 +207,69 @@ def _save_dataurl(dataurl, prefix):
     return path
 
 
+def _media_ratio(path):
+    """Exact display ratio (Fraction) of an image/video via ffprobe, or None."""
+    from fractions import Fraction
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path],
+            capture_output=True, text=True, timeout=30)
+        w, h = (int(x) for x in r.stdout.strip().split("x")[:2])
+        if w < 2 or h < 2:
+            return None
+        return Fraction(w, h).limit_denominator(1000)
+    except Exception:
+        return None
+
+
+def _auto_aspect(ratio):
+    """The render bucket whose ratio is closest to the input's (log distance)."""
+    import math
+    return min(CONFIG["aspects"].items(),
+               key=lambda kv: abs(math.log(float(ratio)) - math.log(
+                   kv[1]["width"] / kv[1]["height"])))[0]
+
+
+def _crop_to_ratio(job, clip_path):
+    """Center-crop the finished clip so its ratio EXACTLY matches the input
+    picture the job was anchored to (only jobs submitted with aspect 'auto').
+    Runs before the upload, so Discord and the app both get the exact clip."""
+    target = job.get("target_ratio")
+    if not target or ":" not in str(target):
+        return clip_path
+    from fractions import Fraction
+    try:
+        tw, th = (int(x) for x in str(target).split(":"))
+        want = Fraction(tw, th)
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0",
+             clip_path], capture_output=True, text=True, timeout=30)
+        W, H = (int(x) for x in r.stdout.strip().split("x")[:2])
+        if abs(float(Fraction(W, H)) - float(want)) < 0.005:
+            return clip_path  # already there
+        if float(Fraction(W, H)) > float(want):
+            newW, newH = int(H * float(want)) // 2 * 2, H       # too wide
+        else:
+            newW, newH = W, int(W / float(want)) // 2 * 2       # too tall
+        if newW < 16 or newH < 16:
+            return clip_path
+        out = clip_path[:-4] + "_exact.mp4"
+        rr = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", clip_path, "-vf",
+             f"crop={newW}:{newH}:{(W - newW) // 2}:{(H - newH) // 2}",
+             "-c:v", "libx264", "-crf", "17", "-preset", "fast",
+             "-pix_fmt", "yuv420p", "-c:a", "copy", out], timeout=600)
+        if rr.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 5000:
+            os.replace(out, clip_path)
+            print(f"[sora] {job.get('id')}: cropped to exact input ratio "
+                  f"{newW}x{newH}", flush=True)
+    except Exception as e:
+        print(f"[sora] {job.get('id')}: ratio crop skipped: {e}", flush=True)
+    return clip_path
+
+
 def _to_wav(path):
     """H3 voice refs want wav and choke past ~15s — convert/trim via ffmpeg."""
     if path.endswith(".wav"):
@@ -263,11 +326,22 @@ def _scaffold_ref2va(prompt, voiceless=False):
     music = ("subtle background music matching the mood of the scene"
              if MUSIC_WORDS.search(prompt) else "none")
     if voiceless:
+        # say nothing about voices when the prompt has no line — claiming a
+        # voice there is what made the model babble gibberish to fill it
+        if _has_dialogue(prompt):
+            speech = ("The character delivers the quoted line clearly in natural English, "
+                      "one clean breath, lips moving in sync with every word.\n")
+            sound = ("overall_soundscape: one clear human voice speaking the quoted line with quiet "
+                     "room tone between words, plus the scene's own natural ambient sound\n")
+        else:
+            speech = ("Nobody speaks — the characters make no words, only natural reactions. "
+                      "No voice of any kind, no background chatter, no babble.\n")
+            sound = ("overall_soundscape: quiet room tone with soft natural ambient sound only — "
+                     "no voices of any kind; the only audio is the scene itself "
+                     "(wind, machines, footsteps)\n")
         return (f"integrated_multimodal_description: [Shot 1] "
                 f"The subject shown in <Picture 1>, {prompt}\n"
-                f"The character speaks in their own natural, clear voice.\n"
-                f"Any spoken lines are in clear English.\n"
-                f"overall_soundscape: natural diegetic sound matching the scene and its action, clean and unprocessed\n"
+                f"{speech}{sound}"
                 f"non_diegetic_music: {music}")
     return (f"integrated_multimodal_description: [Shot 1] "
             f"The subject shown in <Picture 1>, speaking with the voice of <Audio 1>, {prompt}\n"
@@ -287,10 +361,18 @@ def _scaffold_i2v(prompt):
     """i2v: one first-frame anchor (the chain/seed image), motion continues from it."""
     music = ("subtle background music matching the mood of the scene"
              if MUSIC_WORDS.search(prompt) else "none")
-    clause = f" {SPOKEN_CLAUSE}" if _has_dialogue(prompt) else ""
+    spoken = _has_dialogue(prompt)
+    clause = f" {SPOKEN_CLAUSE}" if spoken else (
+        " Nobody speaks — the characters make no words, only natural reactions."
+        " No voice of any kind, no background chatter, no babble.")
+    sound = ("overall_soundscape: natural diegetic sound matching the scene and its action, "
+             "clean and unprocessed" if spoken else
+             "overall_soundscape: quiet room tone with soft natural ambient sound only — "
+             "no voices of any kind; the only audio is the scene itself "
+             "(wind, fire, footsteps, machines)")
     return (f"For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.\n"
             f"integrated_multimodal_description: [Shot 1] {prompt}{clause}\n"
-            f"overall_soundscape: natural diegetic sound matching the scene and its action, clean and unprocessed\n"
+            f"{sound}\n"
             f"non_diegetic_music: {music}")
 
 
@@ -433,7 +515,7 @@ def _render_vpipe(job):
                                      "not [n,", "cannot", "invalid"))]
         reason = " | ".join(bad[-4:])[-400:] if bad else tail[-400:]
         raise RuntimeError(f"vpipe render failed (exit {proc.returncode}): {reason}")
-    return out_abs
+    return _crop_to_ratio(job, out_abs)
 
 
 POST_QUEUE = []
@@ -1130,7 +1212,7 @@ class Handler(BaseHTTPRequestHandler):
                                 break
                     # chains share ONE canvas — mixed orientations are what makes a sequence cursed
                     aspect = chain_aspect
-                    if s.get("voice") and i > 0 and s.get("voice_key", "eric") == "eric":
+                    if s.get("voice") and i > 0 and s.get("voice_key", DEFAULT_VOICE_KEY) == DEFAULT_VOICE_KEY:
                         # VO shot: ref2va standalone with the user's face + voice
                         for a in SHACK.get("assets", []):
                             if a["key"] == s.get("image_key"):
@@ -1196,11 +1278,19 @@ class Handler(BaseHTTPRequestHandler):
         if quality not in CONFIG["qualities"]:
             quality = "standard"
         aspect = (data.get("aspect") or "square").lower()
-        if aspect not in CONFIG["aspects"]:
+        auto_aspect = aspect == "auto"  # match the clip to the input picture
+        if auto_aspect:
+            aspect = "wide"  # provisional; refined below once the image lands
+        elif aspect not in CONFIG["aspects"]:
             aspect = "square"
         duration = int(data.get("duration") or 5)
         if duration not in CONFIG["durations"]:
             duration = 5
+        # where a job came from — "discord:<name>" from the Discord bot,
+        # absent from the app. carried through to the gallery for visibility.
+        source = data.get("source")
+        source = (re.sub(r"[^A-Za-z0-9_#. @:-]", "", str(source))[:60] or None
+                  if isinstance(source, str) and source.strip() else None)
         # A line the clip cannot speak comes out garbled — bounce it at the
         # door with the math; the app shows this error verbatim.
         spoken = spoken_words(prompt)
@@ -1251,13 +1341,22 @@ class Handler(BaseHTTPRequestHandler):
                     image_path = a["file"]
                     break
         if not voice_path and data.get("voice_key"):
-            if data["voice_key"] == "eric":
+            if data["voice_key"] == DEFAULT_VOICE_KEY:
                 voice_path = SHACK.get("character", {}).get("voice", {}).get("file")
                 if voice_path and not os.path.exists(voice_path):
                     voice_path = None
         if voice_path and not image_path:
             return self._send({"error": "voice needs an image"}, 400)
 
+        target_ratio = None
+        if auto_aspect:
+            anchor = image_path or (key_paths[0] if key_paths else None)
+            ratio = _media_ratio(anchor) if anchor else None
+            if ratio:
+                aspect = _auto_aspect(ratio)
+                target_ratio = f"{ratio.numerator}:{ratio.denominator}"
+            else:
+                aspect = "wide"
         ip = self._client_ip()
         with _lock:
             state = _load_state()
@@ -1282,6 +1381,8 @@ class Handler(BaseHTTPRequestHandler):
             job = {
                 "id": job_id, "prompt": prompt[:CONFIG["prompt_max_chars"]],
                 "quality": quality, "aspect": aspect, "duration": duration,
+                "target_ratio": target_ratio,
+                "source": source,
                 "has_image": bool(image_path), "has_voice": bool(voice_path),
                 "ref_mode": ref_mode, "zoom": zoom, "focus": focus,
                 "image_path": image_path or (key_paths[0] if key_paths else None),
@@ -1315,6 +1416,7 @@ class Handler(BaseHTTPRequestHandler):
     def _public(j):
         pub = {k: j.get(k) for k in ("id", "prompt", "status", "backend",
                                      "quality", "aspect", "duration", "ref_mode",
+                                     "source",
                                      "has_image", "has_voice", "created",
                                      "started", "finished")}
         pub["ref_count"] = len(_ref_paths(j))
@@ -1326,40 +1428,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _sync_cuts():
-    """Mirror any workshop cuts (eli-tv uploads on R2) into ~/johnnyb_h3/inputs/cuts/
-    so Shot Planner commands reference real local files."""
-    import shutil
-    cuts_dir = f"{HOME}/johnnyb_h3/inputs/cuts"
-    os.makedirs(cuts_dir, exist_ok=True)
-    url = "https://snail3d.com/api/elitv/manifest"
-    # token comes from the elitv worker (same password hash scheme) — stored beside config
-    tok_file = os.path.join(HERE, "elitv_token.txt")
-    if not os.path.exists(tok_file):
-        return
-    token = open(tok_file).read().strip()
-    req = urllib.request.Request(url, headers={"X-EliTV-Token": token})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            manifest = json.loads(resp.read().decode())
-    except Exception:
-        return
-    for item in manifest.get("uploads", []):
-        name = item["name"]
-        dest = os.path.join(cuts_dir, name)
-        if os.path.exists(dest):
-            continue
-        try:
-            areq = urllib.request.Request(
-                f"https://snail3d.com/api/elitv/asset/{item['key']}",
-                headers={"X-EliTV-Token": token})
-            with urllib.request.urlopen(areq, timeout=60) as r:
-                data = r.read()
-            with open(dest + ".tmp", "wb") as f:
-                f.write(data)
-            os.replace(dest + ".tmp", dest)
-            print(f"[sora] synced cut {name}", flush=True)
-        except Exception as e:
-            print(f"[sora] cut sync {name}: {e}", flush=True)
+    """OPTIONAL hook: pull reference clips into the render box so the Shot
+    Planner can point commands at real local files. Left inert for a fresh
+    install — wire it to your own asset source if you want live uploads."""
+    return
 
 
 def _cuts_sync_loop():
@@ -1384,22 +1456,42 @@ def _load_shack():
 SHACK = _load_shack()
 
 
+def _sets_brief():
+    """One WORLD line per set defined in shack_manifest.json (the buyer's own)."""
+    lines = []
+    for st in SHACK.get("sets", []):
+        lines.append(f"- Set {st.get('name', 'SET')} ({st.get('aliases', '')}): "
+                     f"{st.get('desc', 'describe your set in shack_manifest.json')}.\n")
+    return "".join(lines) or "- (no sets yet — add them under \"sets\" in shack_manifest.json)\n"
+
+
+def _voice_brief():
+    v = SHACK.get("character", {}).get("voice", {})
+    if v.get("key"):
+        return (f"- The subject's voice reference is available (voice key "
+                f"'{v['key']}'): {v.get('desc', 'your voice')}.\n")
+    return ""
+
+
+DEFAULT_VOICE_KEY = SHACK.get("character", {}).get("voice", {}).get("key", "myvoice")
+
+
 def _builder_system():
     lib = [{"key": a["key"], "set": a["set"], "desc": a["desc"]} for a in SHACK.get("assets", [])]
     return (
         "You are the sNora Scene Builder — a master director/showrunner who chats with the user, plans MiniMax H3 video shots for the render farm, and directs their continuity.\n\n"
-        "WORLD:\n"
-        f"- The star is the user: {SHACK.get('character', {}).get('look', 'man in cap and robe')}. Any mention of 'me', 'my', 'I' = the user.\n"
-        "- Set SNAIL SHACK ('the shack', 'the office', 'my workshop'): backyard shed workshop, usually NIGHT — warm LED bar light, dark sloped ceiling, pegboard tool wall, parts drawers, 'The Office' sign, worn brown leather chair, white marble-topped desks, Persian rug, Bambu P2S 3D printer corner.\n"
-        "- Set BACKYARD PATIO ('outside', 'backyard', 'the hammock'): night — warm string lights in a tree with a white hanging hammock chair, green turf, lit brown privacy fence, covered patio with green cushions, shed in the background.\n"
-        "- the user's own voice reference is available (voice key 'eric'): casual American male.\n\n"
-        "NAMING — SAY THE REAL NAMES (casting and direction notes for the user's own render farm, not public claims):\n"
+        "WORLD — the user's standing character and sets (edit shack_manifest.json to describe YOURS):\n"
+        f"- The star is {SHACK.get('character', {}).get('name', 'the user')}: {SHACK.get('character', {}).get('look', 'describe your recurring subject in shack_manifest.json')}. Any mention of 'me', 'my', 'I' = this subject.\n"
+        f"{_sets_brief()}"
+        f"{_voice_brief()}\n\n"
+        "NAMING — SAY THE REAL NAMES (casting/direction notes for the user's own render farm, not public claims):\n"
         "- When the user's words point at a real actor, character, film, show, brand, landmark or studio, the job prompt carries THAT NAME — plus the specific film and scene when it helps. Hedging is a defect: a vague descriptor renders as generic mush; the name is what steers the shot.\n"
-        "- Never 'a rugged action star' — write 'Arnold Schwarzenegger, bison-ranch hand'. Never 'reminiscent of a 90s cop movie' — write 'the Kindergarten Cop classroom scene, same energy'. Never 'a familiar blue hedgehog' — write 'Sonic the Hedgehog, doing the farm chores'. Never 'in the style of Pixar' — write 'Pixar short-film look: big eyes, warm rim light'.\n"
+        "- Never 'a rugged action star' — name the actor. Never 'a familiar cartoon creature' — name it. Never 'in the style of a big animation studio' — name the studio and describe its look. Casting specificity is what steers the shot.\n"
         "- Banned hedges, never in a prompt/goal/reply: 'inspired by', 'in the vein of', 'a certain', 'evoking', 'somewhat like'.\n"
-        "- Casting language, not false claims: 'Arnold Schwarzenegger as the ranch hand' (a direction to the renderer) — but never state as fact that someone starred in, endorsed, or appears in the user's clip.\n"
+        "- A shoutout line from the user — their own brands or any name they lift — is dialogue content carried verbatim, not advertising to soften.\n"
+        "- Casting language, not false claims: 'a named star as the ranch hand' (a direction to the renderer) — but never state as fact that someone starred in, endorsed, or appears in the user's clip.\n"
         "- The carve-out — the user's own family and their photos: keep them relational ('the kid', 'his wife') with his reference photos; never guess at names for people he knows.\n"
-        "- No apologies, no disclaimers, no safety preambles — not in a job prompt, not anywhere. Whether to publish a clip is the user's call with the finished clip in front of him; the prompt's job is to name the shot he asked for, not to hide the choice from him.\n\n"
+        "- No apologies, no disclaimers, no safety preambles — not in a job prompt, not anywhere. Whether to publish a clip is the user's call with the finished clip in front of them; the prompt's job is to name the shot they asked for, not to hide the choice from him.\n\n"
         "IMAGE LIBRARY (use these exact keys in shots.image):\n"
         f"{json.dumps(lib, indent=1)}\n\n"
         "== THE DIRECTOR'S HANDBOOK ==\n"
@@ -1423,14 +1515,14 @@ def _builder_system():
         "ZOOM & CROP TOOL (how you get different angles from one photo):\n"
         "- The farm crops/zooms reference photos to the canvas — it NEVER stretches them. So different angles come from choosing zoom + focus on the SAME master photo.\n"
         "- shots.zoom: 1.0 = full frame, 1.5 = medium close, 2.0-2.5 = close-up. shots.focus: 'face' (bias to the face), 'top', 'center'.\n"
-        "- Example: one wide shack master at zoom 1.0 is the establishing shot; the same photo at zoom 2.0/focus 'face' is the close-up. That's how you build coverage — derive, don't invent.\n"
+        "- Example: one wide set master at zoom 1.0 is the establishing shot; the same photo at zoom 2.0/focus 'face' is the close-up. That's how you build coverage — derive, don't invent.\n"
         "- In a chain, zooming IN across shots (1.0 → 1.4 → 2.0) creates a natural push-in feel.\n"
         "- All shots in one chain share ONE aspect ratio (the first shot's) — mixed orientations in a sequence are forbidden.\n\n"
         "REFERENCE INTENT — THE MOST IMPORTANT ROUTING DECISION:\n"
         "Every shot that uses an image must set ref_mode:\n"
-        "- ref_mode='scene' — the photo's LOCATION AND TIME OF DAY ARE the scene (first-frame anchor). Use ONLY when the user wants to continue in the photo's actual setting (the shack at night, the backyard at night).\n"
-        "- ref_mode='identity' — the photo defines WHO the user is, NOT where he is. Use whenever the user describes a NEW OR DIFFERENT setting from the photo: different location, daytime when the photo is night, a whole new world (Andy's room, the beach, space). Ref2VA carries the user into the freshly-prompted scene.\n"
-        "- If the user's described scene matches no library photo's setting: either (a) ref_mode='identity' with the closest the user image — the prompt's scene wins, or (b) image=null with a rich character description in the prompt (pure text-to-video).\n"
+        "- ref_mode='scene' — the photo's LOCATION AND TIME OF DAY ARE the scene (first-frame anchor). Use ONLY when the user wants to continue in the photo's actual setting (same place, same time of day).\n"
+        "- ref_mode='identity' — the photo defines WHO the subject is, NOT where they are. Use whenever the user describes a NEW OR DIFFERENT setting from the photo: different location, daytime when the photo is night, a whole new world (the beach, space, a fantasy set). Ref2VA carries the subject into the freshly-prompted scene.\n"
+        "- If the user's described scene matches no library photo's setting: either (a) ref_mode='identity' with the closest subject image — the prompt's scene wins, or (b) image=null with a rich character description in the prompt (pure text-to-video).\n"
         "- NEVER use ref_mode='scene' just because a nice photo exists — that pins the photo's background onto the clip. This is the #1 failure mode.\n"
         "- Library images carry scene tags in their descriptions ('night'/'day'/'golden hour' + location) — match scene AND time when anchoring.\n\n"
         "CONTINUITY & TRANSITIONS — two tools plus a effects rack, choose deliberately:\n"
@@ -1441,8 +1533,8 @@ def _builder_system():
         "- Chained shots: write openings that MATCH the previous ending (pose, camera framing, energy). Cut/effect shots: write as fresh starts — reuse the set's base image key for the new angle, or image=null for time skips.\n"
         "- Shots in the same location (non-chained) use the SAME base image key. Establishing/empty-set shots use the *_wide / corner keys.\n"
         "VOICEOVER — a first-class tool:\n"
-        "- On-camera dialogue: <d>[English] the words</d> + voice=true (the user's reference voice, Ref2VA pipeline).\n"
-        "- OFF-SCREEN VOICEOVER ( narration over any scene ): voice=true AND prompt phrased exactly like: 'the user narrates in an off-screen voiceover — <the narration>, while his lips remain completely closed' or 'says in an off-screen voiceover ... while his lips remain completely closed'. For pure b-roll narration use image=null in chained plans, or the subject shot with image=<the user pose key>. VO shots work best as their own shot (transition='cut' into or out of them).\n"
+        "- On-camera dialogue: <d>[English] the words</d> + voice=true (the subject's reference voice, Ref2VA pipeline).\n"
+        "- OFF-SCREEN VOICEOVER ( narration over any scene ): voice=true AND prompt phrased exactly like: 'the subject narrates in an off-screen voiceover — <the narration>, while their lips remain completely closed' or 'says in an off-screen voiceover ... while his lips remain completely closed'. For pure b-roll narration use image=null in chained plans, or the subject shot with image=<a pose key>. VO shots work best as their own shot (transition='cut' into or out of them).\n"
         "- Max ~2 short VO beats (≤10 words each) per 5s clip; insert silent visual beats between dense narration.\n"
         "- No dialogue = ambient sound only. Music only via non_diegetic_music when the user asks.\n"
         "- Single (non-chained) image shots: the image becomes BOTH first and last frame — write motion that starts and settles near that pose.\n\n"
@@ -1453,7 +1545,7 @@ def _builder_system():
         "- One intent per line; one speaker per shot. Write it as: He says, <emotion>: \"<line>\" — placed at the END of the scene description, before the Soundscape line.\n"
         "- When the scene invites words and the user gave none, WRITE one line that fits the budget (proactive fill-in); a line over budget gets rewritten shorter, meaning and voice intact.\n"
         "- Leave at least 30% of the clip wordless so the delivery can breathe.\n\n"
-        "IMAGE LIBRARY pose rules: match the shot's action to the pose in the key (typing keys for typing shots, chair keys for talking-to-camera, backyard keys for outdoor).\n\n"
+        "IMAGE LIBRARY pose rules: match the shot's action to the pose in the key (match action to pose — desk keys for desk shots, chair keys for talking-to-camera, outdoor keys for outside).\n\n"
         "OUTPUT — strict JSON only, no markdown fences:\n"
         '{"reply": "<1-3 friendly sentences to the user>", "goal": "<one-sentence synopsis of the whole scene>", '
         '"shots": [{"title": "short name", "prompt": "<complete scene: action + camera + any dialogue>", "aspect": "square", "duration": 5, "quality": "standard", "image": "<library key or null>", "voice": false, "transition": "chain", "ref_mode": "scene"}]}\n'
@@ -1614,7 +1706,7 @@ def _redo_context(job_id, note):
         f"PROMPT: {str(job.get('prompt', ''))[:900]}\n"
         + (f"REFERENCE IMAGE: {os.path.basename(str(job.get('image_path')))}\n"
            if job.get("image_path") else "")
-        + f"\nWHAT ERIC WANTS DIFFERENT: {str(note)[:1200]}\n"
+        + f"\nWHAT THE USER WANTS DIFFERENT: {str(note)[:1200]}\n"
         "\nChange only what he complained about, keep everything he didn't, and do not "
         "repeat the take described above. Reply to him in one or two sentences saying "
         "what you understood, then give the corrected shot(s)."
@@ -1691,7 +1783,7 @@ def _director_note(goal, job, next_job, clip_path):
         return None
 
 
-PREP_PY = "/Users/YOURUSER/mlx-env/bin/python3"
+PREP_PY = os.environ.get("SNORA_PREP_PY", "python3")  # needs Pillow installed
 PREP_SCRIPT = '''
 import sys
 from PIL import Image, ImageOps

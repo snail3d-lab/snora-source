@@ -1,8 +1,21 @@
 {
   "secret": "REPLACE_GENERATE_YOUR_OWN_LONG_RANDOM_HEX",
-  "worker_base": "https://your-worker.example.com",
+  "worker_base": "https://your-frontend.example.com",
   "snail_api_key": "sk-your-own-key",
   "snail_api_base": "http://127.0.0.1:8900",
   "snail_model": "your-model",
-  "render_slots": 1
+  "render_slots": 1,
+  "discord": {
+    "token_file": "/path/to/.sora_discord_token",
+    "service_url": "http://127.0.0.1:7789",
+    "allowed_guild_ids": [
+      "REPLACE-YOUR-DISCORD-SERVER-ID"
+    ],
+    "snora_token": "REPLACE-WITH-THE-BOT-S-ORA-TOKEN",
+    "llm_base": "REPLACE-OPTIONAL-LLM-BASE (falls back to snail_api_base)",
+    "llm_key": "REPLACE-OPTIONAL",
+    "llm_model": "snail-top",
+    "nanny": true,
+    "await_approval": false
+  }
 }

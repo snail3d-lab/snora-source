@@ -1,0 +1,24 @@
+{
+  "_comment": "Copy to shack_manifest.json. This file describes YOUR world: the recurring character, the sets, and the reference library. The Scene Builder and the Discord bot build their prompts from it. Mark an asset discord_ok only if community members may render it.",
+  "character": {
+    "name": "your on-screen persona",
+    "look": "e.g. man in a navy cap and gray robe, salt-and-pepper beard",
+    "voice": {"key": "myvoice", "desc": "casual American male"}
+  },
+  "sets": [
+    {"name": "MY WORKSHOP", "aliases": "'the workshop', 'my office'",
+     "desc": "describe lighting, furniture, camera angles — the more concrete, the steadier the renders"},
+    {"name": "MY BACKYARD", "aliases": "'outside', 'the patio'",
+     "desc": "same here: what a camera sees when it walks in"}
+  ],
+  "assets": [
+    {"key": "hero_front", "file": "/absolute/path/hero_front.png",
+     "desc": "the character, front view, neutral backdrop — the identity master",
+     "discord_ok": true},
+    {"key": "set_wide", "file": "/absolute/path/set_wide.png",
+     "desc": "wide master of the main set, no character in frame",
+     "discord_ok": true},
+    {"key": "family_photo", "file": "/absolute/path/private.png",
+     "desc": "private reference — no discord_ok means Discord members cannot use it"}
+  ]
+}
