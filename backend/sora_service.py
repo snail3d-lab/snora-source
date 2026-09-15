@@ -499,11 +499,29 @@ def _render_vpipe(job):
     ] + extra
     print(f"[sora] {job['id']}: vpipe render {job.get('quality')}/{job.get('aspect')} "
           f"{mode} {a['width']}x{a['height']} {frames}f {q['steps']} steps seed={job['seed']}", flush=True)
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         cmd, cwd=CONFIG["vpipe_cwd"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=CONFIG["stale_secs"])
-    lines = (proc.stdout or "").splitlines()
+        text=True)
+    lines = []
+
+    def _drain():
+        for ln in proc.stdout:
+            ln = ln.rstrip("\n")
+            lines.append(ln)
+            m = _PROGRESS_RE.match(ln)
+            if m:
+                _PROGRESS[job["id"]] = {"pct": int(m.group(1)),
+                                        "stage": m.group(2), "ts": time.time()}
+
+    drainer = threading.Thread(target=_drain, daemon=True)
+    drainer.start()
+    try:
+        proc.wait(timeout=CONFIG["stale_secs"])
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise RuntimeError("vpipe timed out")
+    drainer.join(timeout=5)
     tail = "\n".join(lines[-12:])
     print(f"[sora] {job['id']}: vpipe exit={proc.returncode}\n{tail}", flush=True)
     if proc.returncode != 0 or not os.path.exists(out_abs) \
@@ -518,6 +536,12 @@ def _render_vpipe(job):
         raise RuntimeError(f"vpipe render failed (exit {proc.returncode}): {reason}")
     return _crop_to_ratio(job, out_abs)
 
+
+# ── live render progress: vpipe streams "[PROGRESS] 52% of 'denoise' completed"
+# lines on stdout; the render drainer parses them here so /jobs can expose them
+# and the Discord bot can draw a bar. In-memory only — nobody needs it persisted.
+_PROGRESS = {}
+_PROGRESS_RE = re.compile(r"^\[PROGRESS\] (\d+)% of '([^']+)' completed")
 
 POST_QUEUE = []
 _post_wake = threading.Event()
@@ -1421,6 +1445,11 @@ class Handler(BaseHTTPRequestHandler):
                                      "has_image", "has_voice", "created",
                                      "started", "finished")}
         pub["ref_count"] = len(_ref_paths(j))
+        pr = _PROGRESS.get(j.get("id"))
+        if pr and j.get("status") == "rendering" and time.time() - pr["ts"] < 300:
+            pub["progress"] = pr
+        elif j.get("status") != "rendering" and pr:
+            _PROGRESS.pop(j.get("id"), None)
         if (j.get("sequence") or {}).get("id"):
             pub["seq"] = j["sequence"]["id"]
         if j.get("error"):

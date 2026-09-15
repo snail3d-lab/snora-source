@@ -564,6 +564,19 @@ class SnoraClient(discord.Client):
         # 3. watch it, then deliver
         asyncio.create_task(self.watch_job(job["id"], plan, ch, ack, user, w))
 
+    @staticmethod
+    def _render_line(job):
+        """Queue message while rendering: live bar once the engine reports
+        percentages (each pipeline stage counts its own 0-100)."""
+        p = job.get("progress") or {}
+        if not p:
+            return (f"🎬 **Rendering now** — {job.get('duration')}s · {job.get('aspect')} · "
+                    f"{job.get('quality')} — usually a few minutes.")
+        pct = max(0, min(100, int(p.get("pct", 0))))
+        bar = "▰" * (pct // 10) + "▱" * (10 - pct // 10)
+        return (f"🎬 **Rendering** {bar} **{pct}%** — {str(p.get('stage', ''))[:40]}"
+                f"\n_({job.get('duration')}s · {job.get('aspect')} · {job.get('quality')})_")
+
     async def watch_job(self, jid, plan, ch, ack, user, w):
         started = w[jid]["started"]
         try:
@@ -582,9 +595,7 @@ class SnoraClient(discord.Client):
                     await self.safe_edit(ack, await asyncio.to_thread(
                         lambda s=snap: self._queue_line(job, s)))
                 elif st == "rendering":
-                    await self.safe_edit(
-                        ack, f"🎬 **Rendering now** — {job.get('duration')}s · {job.get('aspect')} · "
-                             f"{job.get('quality')} — usually a few minutes.")
+                    await self.safe_edit(ack, self._render_line(job))
                 elif st == "done":
                     await self.deliver(jid, plan, ch, ack, user, started)
                     break
