@@ -17,6 +17,9 @@
     "llm_model": "snail-top",
     "nanny": true,
     "await_approval": false,
-    "nanny_off_guilds": []
+    "nanny_off_guilds": [],
+    "owner_ids": [
+      "REPLACE-YOUR-DISCORD-USER-ID"
+    ]
   }
 }

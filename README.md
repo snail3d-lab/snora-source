@@ -104,6 +104,8 @@ launchctl load ~/Library/LaunchAgents/com.example.snorabot.plist
 - `nanny_off_guilds: ["<server-id>"]` runs those servers with the gate off
   (adults-only private channels you control); the illegal-content floor
   (anything involving minors) is enforced everywhere, no override.
+- `owner_ids: ["<user-id>"]` — you and your helpers run gate-free in any
+  server (open prompt lane, no spam/concurrency guards), same minors floor.
 - `await_approval: true` holds Discord jobs at YOUR approval gate — nothing
   hits the GPU until you tap approve in the sNora app.
 - Per-member limits: one active job, min spacing between requests, and each

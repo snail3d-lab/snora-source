@@ -44,6 +44,7 @@ DEFAULTS = {
     "await_approval": False,      # True = hold Discord jobs at the owner's gate
     "nanny": True,                # hard PG gate on asks before anything runs
     "nanny_off_guilds": [],       # server IDs with the PG gate OFF (private adult channels)
+    "owner_ids": [],              # user IDs (the operator + helpers): no nanny, no spam guards
     "snora_token": "",            # R2 fallback fetch (X-Sora-Token)
 }
 
@@ -72,6 +73,11 @@ PROFANITY_RE = re.compile(
     r"fag(got)?|nigg\w+|retard\w*|tranny)\b", re.I)
 
 
+def _is_owner(user_id):
+    """Operator allowlist: runs the open lane everywhere and skips bot-side guards."""
+    return str(user_id) in [str(u) for u in CFG.get("owner_ids", [])]
+
+
 def _nanny_on(guild_id):
     """PG lane applies unless globally off or this server is on the open list."""
     if not CFG.get("nanny", True):
@@ -79,12 +85,12 @@ def _nanny_on(guild_id):
     return str(guild_id) not in [str(g) for g in CFG.get("nanny_off_guilds", [])]
 
 
-def nanny_check(text, guild_id=None):
+def nanny_check(text, guild_id=None, user_id=None):
     """Return (short refusal reason, hard) for clearly disallowed asks, else None."""
     # hard floor under EVERY lane — illegal content has no override, no guild exemption
     if MINOR_HOT_RE.search(text):
         return ("that one is a hard no, full stop", True)
-    if not _nanny_on(guild_id):
+    if _is_owner(user_id) or not _nanny_on(guild_id):
         return None
     if NANNY_RE.search(text):
         if MINOR_RE.search(text):
@@ -283,7 +289,7 @@ def system_for(open_lane):
     return SYSTEM[:a] + SAFETY_OPEN + SYSTEM[b:]
 
 
-def craft(ask, has_photo, has_voice=False, guild_id=None):
+def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None):
     """LLM turn: raw member ask -> validated plan dict (or {"error": ...})."""
     if not (CFG["llm_base"] and CFG["llm_key"]):
         return {"error": "the bot's LLM lane isn't configured"}
@@ -296,7 +302,8 @@ def craft(ask, has_photo, has_voice=False, guild_id=None):
                  "rendered character speaks it with that voice.]")
     _, d = _req(CFG["llm_base"] + "/chat/completions",
                 payload={"model": CFG["llm_model"], "temperature": 0.7, "max_tokens": 900,
-                         "messages": [{"role": "system", "content": system_for(not _nanny_on(guild_id))},
+                         "messages": [{"role": "system", "content": system_for(
+                             not _nanny_on(guild_id) or _is_owner(user_id))},
                                       {"role": "user", "content": user}]},
                 headers={"Authorization": f"Bearer {CFG['llm_key']}"}, timeout=120)
     content = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
@@ -431,7 +438,8 @@ class SnoraClient(discord.Client):
 
     async def handle_ask(self, ch, user, text, ack, attachments=()):
         # nanny layer first — some asks should die before costing a token
-        blocked = nanny_check(text, getattr(getattr(ch, "guild", None), "id", None))
+        blocked = nanny_check(text, getattr(getattr(ch, "guild", None), "id", None),
+                              getattr(user, "id", None))
         if blocked:
             reason, hard = blocked
             log.warning("NANNY blocked ask from %s in #%s: %s",
@@ -512,7 +520,8 @@ class SnoraClient(discord.Client):
         # 1. LLM formats the ask into a real scene prompt
         try:
             plan = await asyncio.to_thread(craft, text, bool(imgs), bool(voice),
-                                            getattr(getattr(ch, "guild", None), "id", None))
+                                            getattr(getattr(ch, "guild", None), "id", None),
+                                            getattr(user, "id", None))
         except Exception as e:
             log.exception("llm failed")
             return await ack.edit(content=f"⚠️ Couldn't reach the scene writer ({e.__class__.__name__}). "
@@ -681,6 +690,8 @@ class SnoraClient(discord.Client):
             # photo in, words none — animate the photo itself
             text = "bring this photo to life with natural, gentle cinematic motion"
         gap = time.time() - self.last_ask.get(message.author.id, 0)
+        if _is_owner(message.author.id):
+            gap = 9e9  # operator: no spam/concurrency guards, they triage the queue
         if gap < CFG["min_gap_secs"]:
             await message.reply(f"Easy there — one ask every {CFG['min_gap_secs']}s 🙂",
                                 mention_author=False)
@@ -702,7 +713,8 @@ class SnoraClient(discord.Client):
             if not self.allowed(interaction.channel):
                 await interaction.response.send_message("I don't work in this channel.", ephemeral=True)
                 return
-            if self.active.get(interaction.user.id, 0) >= CFG["max_active_per_user"]:
+            if (not _is_owner(interaction.user.id)
+                    and self.active.get(interaction.user.id, 0) >= CFG["max_active_per_user"]):
                 await interaction.response.send_message("You already have a clip in the pipeline.",
                                                         ephemeral=True)
                 return
