@@ -199,7 +199,8 @@ def _save_dataurl(dataurl, prefix):
     ext = {"mpeg": "mp3", "x-m4a": "m4a"}.get(m.group(2), m.group(2))
     updir = os.path.join(CONFIG["vpipe_sandbox"], "uploads")
     os.makedirs(updir, exist_ok=True)
-    path = os.path.join(updir, f"{prefix}_{int(time.time())}.{ext}")
+    # ms + random suffix: two uploads in the same second must not collide
+    path = os.path.join(updir, f"{prefix}_{int(time.time()*1000)}_{os.urandom(3).hex()}.{ext}")
     with open(path, "wb") as f:
         f.write(base64.b64decode(m.group(3)))
     if os.path.getsize(path) < 500:
