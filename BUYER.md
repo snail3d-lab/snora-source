@@ -13,6 +13,20 @@ clips by @mentioning the bot in your server.
 | `backend/sora_config.example.json` | config template — copy to `sora_config.json` |
 | `backend/shack_manifest.example.json` | **your world** — copy to `shack_manifest.json` and describe your character, sets, and reference photos |
 
+## What hardware it needs (read first)
+Rendering runs **locally on your own Apple Silicon Mac** — no cloud, no
+subscription. The video models are ~60 GB of 8-bit weights that must live in
+unified memory:
+
+| Tier | Spec | What to expect |
+|---|---|---|
+| Minimum | M-series **Max or Ultra with 96 GB** unified memory (e.g. M3 Max 96 GB, Mac Studio M2 Ultra) | works; 5 s clips in roughly 3-6 min |
+| Recommended | **128 GB** Max/Ultra (M4/M5 Max 128 GB, Ultra 128-192 GB) | the author's class of box; ~2 min per clip |
+| Not supported | any Mac with **64 GB or less** (incl. M3 32 GB) | the model physically does not fit |
+| Also | ~150 GB free disk (weights + clips), macOS 14+, Python 3.9+ | weights download once, then it's all local |
+
+The iOS app and Discord bot have no hardware needs — they're just remotes.
+
 ## 1. Backend
 ```bash
 cp backend/sora_config.example.json backend/sora_config.json
