@@ -40,7 +40,8 @@ python3 backend/sora_service.py
 ## 2. iOS app
 Set `API.token` in `Snora/API.swift` to the secret you chose, point the
 backend hosts in `Snora/StudioAPI.swift` / `Snora/AssistAPI.swift` at your
-service, then `xcodegen generate` and run from Xcode with your signing team.
+service, set `DEVELOPMENT_TEAM` in `project.yml` to YOUR Apple team ID, then
+`xcodegen generate` and run from Xcode with your signing.
 
 ## 3. Discord bot (optional)
 Members @-mention the bot with an idea (plus optional photo/audio
