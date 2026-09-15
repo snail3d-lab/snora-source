@@ -101,6 +101,9 @@ launchctl load ~/Library/LaunchAgents/com.example.snorabot.plist
   when rendered.
 - `nanny: true` adds a content gate (no sexual content, no real-person
   smears, PG-13 language) with every rejection logged beside the bot.
+- `nanny_off_guilds: ["<server-id>"]` runs those servers with the gate off
+  (adults-only private channels you control); the illegal-content floor
+  (anything involving minors) is enforced everywhere, no override.
 - `await_approval: true` holds Discord jobs at YOUR approval gate — nothing
   hits the GPU until you tap approve in the sNora app.
 - Per-member limits: one active job, min spacing between requests, and each

@@ -43,6 +43,7 @@ DEFAULTS = {
     "max_wait_secs": 3 * 3600,    # give up watching after 3h
     "await_approval": False,      # True = hold Discord jobs at the owner's gate
     "nanny": True,                # hard PG gate on asks before anything runs
+    "nanny_off_guilds": [],       # server IDs with the PG gate OFF (private adult channels)
     "snora_token": "",            # R2 fallback fetch (X-Sora-Token)
 }
 
@@ -71,12 +72,20 @@ PROFANITY_RE = re.compile(
     r"fag(got)?|nigg\w+|retard\w*|tranny)\b", re.I)
 
 
-def nanny_check(text):
-    """Return (short refusal reason, hard) for clearly disallowed asks, else None."""
+def _nanny_on(guild_id):
+    """PG lane applies unless globally off or this server is on the open list."""
     if not CFG.get("nanny", True):
-        return None
+        return False
+    return str(guild_id) not in [str(g) for g in CFG.get("nanny_off_guilds", [])]
+
+
+def nanny_check(text, guild_id=None):
+    """Return (short refusal reason, hard) for clearly disallowed asks, else None."""
+    # hard floor under EVERY lane — illegal content has no override, no guild exemption
     if MINOR_HOT_RE.search(text):
         return ("that one is a hard no, full stop", True)
+    if not _nanny_on(guild_id):
+        return None
     if NANNY_RE.search(text):
         if MINOR_RE.search(text):
             return ("I don't mix kids and adult content", True)
@@ -250,7 +259,31 @@ def spoken_words(prompt):
     return total
 
 
-def craft(ask, has_photo, has_voice=False):
+SAFETY_OPEN = (
+    "- SAFETY (private channel — most limits are off):\n"
+    "  * Anything involving minors stays absolutely off: never write sexual content for or "
+    "about anyone depicted as a minor; that request rejects with a hard reject_reason.\n"
+    "  * Satire of real people is allowed, but never phrase it as a fact about them — no "
+    "staged confessions, crimes, arrests, or mock-documentary presented as real. Obviously "
+    "cartoonish = fine.\n"
+    "  * Everything else is on the table: strong language, sexual and erotic themes, "
+    "violence and gore, religious or blasphemous material, dark comedy, and any fictional "
+    "character, franchise, or brand by its real name (Sonic, Mario, Godzilla, whoever). "
+    "Write what is asked, with no disclaimers and no hedging.\n"
+    "  * Refusing is one calm line in reject_reason — friendly, no lecture.\n\n"
+)
+
+
+def system_for(open_lane):
+    """PG prompt by default; open-lane prompt swaps the SAFETY block wholesale."""
+    if not open_lane:
+        return SYSTEM
+    a = SYSTEM.index("- SAFETY (hard rules of this server):")
+    b = SYSTEM.index("OUTPUT — strict JSON only")
+    return SYSTEM[:a] + SAFETY_OPEN + SYSTEM[b:]
+
+
+def craft(ask, has_photo, has_voice=False, guild_id=None):
     """LLM turn: raw member ask -> validated plan dict (or {"error": ...})."""
     if not (CFG["llm_base"] and CFG["llm_key"]):
         return {"error": "the bot's LLM lane isn't configured"}
@@ -263,7 +296,7 @@ def craft(ask, has_photo, has_voice=False):
                  "rendered character speaks it with that voice.]")
     _, d = _req(CFG["llm_base"] + "/chat/completions",
                 payload={"model": CFG["llm_model"], "temperature": 0.7, "max_tokens": 900,
-                         "messages": [{"role": "system", "content": SYSTEM},
+                         "messages": [{"role": "system", "content": system_for(not _nanny_on(guild_id))},
                                       {"role": "user", "content": user}]},
                 headers={"Authorization": f"Bearer {CFG['llm_key']}"}, timeout=120)
     content = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
@@ -398,7 +431,7 @@ class SnoraClient(discord.Client):
 
     async def handle_ask(self, ch, user, text, ack, attachments=()):
         # nanny layer first — some asks should die before costing a token
-        blocked = nanny_check(text)
+        blocked = nanny_check(text, getattr(getattr(ch, "guild", None), "id", None))
         if blocked:
             reason, hard = blocked
             log.warning("NANNY blocked ask from %s in #%s: %s",
@@ -478,7 +511,8 @@ class SnoraClient(discord.Client):
             break
         # 1. LLM formats the ask into a real scene prompt
         try:
-            plan = await asyncio.to_thread(craft, text, bool(imgs), bool(voice))
+            plan = await asyncio.to_thread(craft, text, bool(imgs), bool(voice),
+                                            getattr(getattr(ch, "guild", None), "id", None))
         except Exception as e:
             log.exception("llm failed")
             return await ack.edit(content=f"⚠️ Couldn't reach the scene writer ({e.__class__.__name__}). "
