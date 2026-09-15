@@ -1,8 +1,32 @@
-# sNora — source license
+# sNora
 
-A complete AI-video setup: an iOS client, the Python backend that runs a
-render farm queue, and an optional Discord bot so your community can request
-clips by @mentioning the bot in your server.
+A self-owned AI video setup. You write a line, maybe attach a photo, and a
+finished clip comes back a few minutes later — drawn on a Mac you already
+own. Nothing goes through anyone's cloud: no queue on someone else's server,
+no per-render bill, no account. The apps are remotes; the render farm is
+yours.
+
+It comes as three parts that work together or separately: apps for iPhone,
+iPad and Apple Watch, a Discord bot your server members can @-mention, and a
+stdlib-only Python backend that runs the whole farm.
+
+## What you get
+- **iPhone + iPad app** — write a prompt or just talk to it, attach reference
+  photos and a voice, then watch takes land in a reel with a poster wall.
+  It keeps polling in the background and pings you when a clip is done.
+- **Apple Watch app** — the render feed on your wrist with a live progress
+  bar, and a big hold-to-talk mic that sends your idea to the iPhone to
+  become a job. A watch-face complication shows render percent.
+- **Discord bot** — members @-mention it and get the clip back in-channel.
+  Live progress bar with seconds-remaining, per-server content gate, an
+  approval gate you hold, per-member limits.
+- **Python backend** — a job queue, an HTTP API, prompt composition, and
+  delivery, in one stdlib-only file: no framework, no dependencies, one
+  config.
+- **Begin-to-end morphing** — point a render at where it should end, not just
+  where it starts.
+- **A browser viewer** (`GET /view`) so any phone, Android included, can watch
+  the queue and play finished clips with no install.
 
 ## Pieces
 | File | What it does |
@@ -12,6 +36,8 @@ clips by @mentioning the bot in your server.
 | `backend/discord_bot.py` | the Discord bot (@sNora → queue → clip back in chat) |
 | `backend/sora_config.example.json` | config template — copy to `sora_config.json` |
 | `backend/shack_manifest.example.json` | **your world** — copy to `shack_manifest.json` and describe your character, sets, and reference photos |
+| `backend/ENGINES.md` | which render engine to install (Vpipe Manager or ComfyUI) and the exact model weights each one pulls |
+| `backend/LLM-LANE.md` | the prompt-writer "sauce": the OpenAI-compatible model that formats prompts and plans shots, with recipes for a spare Mac or a DGX Spark cluster |
 
 ## What hardware it needs (read first)
 Rendering runs **locally on your own Apple Silicon Mac** — no cloud, no
@@ -26,6 +52,10 @@ unified memory:
 | Also | ~150 GB free disk (weights + clips), macOS 14+, Python 3.9+ | weights download once, then it's all local |
 
 The iOS app and Discord bot have no hardware needs — they're just remotes.
+
+Before you start: the render engine is a separate install
+(Vpipe Manager or ComfyUI, plus a few dozen GB of video weights).
+`backend/ENGINES.md` lists exactly what to grab and where it goes.
 
 ## 1. Backend
 ```bash
@@ -114,7 +144,7 @@ launchctl load ~/Library/LaunchAgents/com.example.snorabot.plist
   your app can badge them.
 
 ## Notes
-- Every credential, path, hostname, and persona string from the author's own
+- Every credential, path, hostname, and persona string from the original
   deployment is a placeholder or generic on purpose — the prompts describe
   YOUR world once you fill in the manifest.
 - License: see `LICENSE.md`.
