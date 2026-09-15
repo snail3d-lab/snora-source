@@ -20,7 +20,7 @@ struct AssistPlan: Codable {
 }
 
 /// the user's own snail-api models — the assist brain is NEVER an external API.
-/// base/key read from ~/snail3d.com/sora/sora_config.json (2026-09-09) and baked.
+/// base/key read from your sora_config.json (2026-09-09) and baked.
 enum AssistAPI {
     static let base = "http://127.0.0.1:8900/v1"
     static let key = "REPLACE_WITH_YOUR_SNAIL_API_KEY"
@@ -28,7 +28,7 @@ enum AssistAPI {
     /// the app's own mic log, readable with no login — the user pastes this URL to me
     /// and I can see exactly where a take died. The gateway's /v1 prefix does not
     /// route it, so it goes through the normal /api/sora path.
-    static let logUrl = "https://snail3d.com/api/sora/assist/log"
+    static let logUrl = "https://YOUR-BACKEND.example.com/api/sora/assist/log"
 
     /// planner model — configurable in case the fleet swaps slots (default "snail-top",
     /// which today resolves to qwen3.8-flash-next on the gateway)

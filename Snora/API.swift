@@ -22,7 +22,7 @@ struct Job: Identifiable, Codable {
     var url: String?
 
     var videoURL: URL? {
-        url.flatMap { URL(string: "https://snail3d.com\($0)") }
+        url.flatMap { URL(string: "https://YOUR-BACKEND.example.com\($0)") }
     }
 
     var isDone: Bool {
@@ -90,7 +90,7 @@ struct RefList: Codable {
 }
 
 enum API {
-    static let base = "https://snail3d.com/api/sora"
+    static let base = "https://YOUR-BACKEND.example.com/api/sora"
 
     /// baked farm token — the single source of truth.
     /// never read from UserDefaults: a stale unlock-era token used to silently override it.
@@ -127,7 +127,7 @@ enum API {
         switch e.code {
         case .timedOut: return "timed out — this connection is too slow for the photos, try wi-fi"
         case .notConnectedToInternet: return "no internet connection"
-        case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed: return "can't reach snail3d.com"
+        case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed: return "can't reach the server"
         case .networkConnectionLost: return "connection dropped mid-upload"
         default: return e.localizedDescription
         }
@@ -206,7 +206,7 @@ enum API {
         if let u = videoCache[id], FileManager.default.fileExists(atPath: u.path) {
             return u
         }
-        var req = URLRequest(url: URL(string: "https://snail3d.com\(remote)")!)
+        var req = URLRequest(url: URL(string: "https://YOUR-BACKEND.example.com\(remote)")!)
         req.setValue(token, forHTTPHeaderField: "X-Sora-Token")
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let h = resp as? HTTPURLResponse, h.statusCode == 200 else {
