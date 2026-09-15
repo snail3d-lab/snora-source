@@ -425,6 +425,8 @@ class SnoraClient(discord.Client):
     def _queue_line(job, snapshot):
         """Human-readable queue state for a queued job, with a heads-up on
         what's ahead — one render at a time, ~5 min a clip is the honest guess."""
+        if isinstance(snapshot, dict):      # farm_get hands back {"jobs": [...]}
+            snapshot = snapshot.get("jobs", [])
         queued = sorted((j for j in snapshot if j.get("status") == "queued"),
                         key=lambda j: j.get("created", 0))
         rendering = [j for j in snapshot if j.get("status") == "rendering"]
@@ -601,6 +603,7 @@ class SnoraClient(discord.Client):
 
     async def watch_job(self, jid, plan, ch, ack, user, w):
         started = w[jid]["started"]
+        terminal = False   # became done/failed/removed — only THEN mark handled
         try:
             while time.time() - started < CFG["max_wait_secs"]:
                 await asyncio.sleep(CFG["poll_secs"])
@@ -608,20 +611,29 @@ class SnoraClient(discord.Client):
                     snap = await asyncio.to_thread(farm_get, "/jobs")
                     job = next((j for j in snap.get("jobs", []) if j.get("id") == jid), None)
                 except Exception:
-                    continue  # farm briefly unreachable — keep waiting
+                    log.exception("watch %s: poll failed; staying alive", jid)
+                    continue  # farm unreachable or a status line choked — keep waiting
                 if job is None:
+                    terminal = True
                     await self.safe_edit(ack, "🗑️ Your job was removed from the queue.")
                     break
                 st = job.get("status")
                 if st == "queued":
-                    await self.safe_edit(ack, await asyncio.to_thread(
-                        lambda s=snap: self._queue_line(job, s)))
+                    try:
+                        line = await asyncio.to_thread(
+                            lambda s=snap: self._queue_line(job, s))
+                    except Exception:
+                        log.exception("watch %s: queue line failed", jid)
+                        line = "⏳ Still in the queue — I'll edit this when my turn is up."
+                    await self.safe_edit(ack, line)
                 elif st == "rendering":
                     await self.safe_edit(ack, self._render_line(job))
                 elif st == "done":
+                    terminal = True
                     await self.deliver(jid, plan, ch, ack, user, started)
                     break
                 elif st == "failed":
+                    terminal = True
                     await self.safe_edit(ack, f"💥 The render failed: {str(job.get('error', 'unknown'))[:200]}")
                     break
             else:
@@ -631,7 +643,7 @@ class SnoraClient(discord.Client):
             # record completion FIRST — a crash after delivery must never make
             # a restart redeliver the same clip (this actually happened)
             w = _load_watch()
-            if jid in w:
+            if jid in w and terminal:
                 w[jid]["done_notified"] = True
                 # keep completed entries a day for forensics, then drop them
                 if time.time() - started > 86400:
