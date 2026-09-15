@@ -75,6 +75,7 @@ CONFIG = {
     },
     "durations": {3: 73, 4: 90, 5: 124, 8: 192, 10: 243, 15: 362},   # seconds -> frames (17n+5)
     "vpipe_pipeline_fl2va": "pipelines/minimax-h3-first-last-to-video.vpipeline",
+    "vpipe_pipeline_be2v": "pipelines/minimax-h3-begin-end-to-video.vpipeline",
     "vpipe_pipeline_ref2va": "pipelines/minimax-h3-ref2va-minimal.vpipeline",
     "vpipe_pipeline_i2v": "pipelines/minimax-h3-i2v-first.vpipeline",
     # comfy fallback
@@ -429,7 +430,31 @@ def _render_vpipe(job):
 
     identity = job.get("ref_mode") == "identity" and img is not None
     multi = (job.get("image_paths") or [])[:9]
-    if img and (vox or identity or multi):
+    end_img = job.get("end_image_path")
+    if end_img and not os.path.isfile(end_img):
+        end_img = None
+    if img and end_img:
+        # explicit begin+end: the FL2VA model morphs FIRST picture -> LAST
+        # picture; the scaffold already declares Picture 1 at 0.00s and
+        # Picture 2 at the final mark, so the prompt needs no new format.
+        try:
+            end_img = _prep_image(end_img, 1024, 1024, 1.0, "center")
+            end_img = _prep_image(end_img, a["width"], a["height"], 1.0,
+                                  job.get("focus") or "center")
+        except Exception as e:
+            print(f"[sora] {job['id']}: end-image prep failed, using raw: {e}", flush=True)
+        pipeline = CONFIG["vpipe_pipeline_be2v"]
+        prompt = _scaffold_fl2va(job["prompt"], int(job.get("duration") or 5))
+        extra = [
+            "--stage-cfg", f"load-image::url=[\"{img}\"]",
+            "--stage-cfg", f"load-image-end::url=[\"{end_img}\"]",
+            "--stage-cfg", f"first-frame::width={a['width']}",
+            "--stage-cfg", f"first-frame::height={a['height']}",
+            "--stage-cfg", f"last-frame::width={a['width']}",
+            "--stage-cfg", f"last-frame::height={a['height']}",
+        ]
+        mode = "be2v(begin+end)"
+    elif img and (vox or identity or multi):
         pipeline = CONFIG["vpipe_pipeline_ref2va"]
         prompt = _scaffold_ref2va(job["prompt"], voiceless=not vox)
         # The ref encoder only builds valid rows [n,96]/[n,32] when an audio ref is
@@ -1391,6 +1416,7 @@ class Handler(BaseHTTPRequestHandler):
         # (await_approval false/absent) queue immediately, exactly as before
         await_approval = bool(data.get("await_approval", False))
         image_path = voice_path = None
+        end_image_path = None
         key_paths = []
         for k in (data.get("image_keys") or [])[:9]:
             if isinstance(k, str) and re.fullmatch(r"[a-z0-9_]+", k):
@@ -1409,6 +1435,8 @@ class Handler(BaseHTTPRequestHandler):
             if uploads:
                 image_path = uploads[0]
                 key_paths = uploads[1:] + key_paths
+            if data.get("end_image"):
+                end_image_path = _save_dataurl(data["end_image"], "end")
             if data.get("voice"):
                 voice_path = _save_dataurl(data["voice"], "vox")
                 if not image_path:
@@ -1431,6 +1459,13 @@ class Handler(BaseHTTPRequestHandler):
                     voice_path = None
         if voice_path and not image_path:
             return self._send({"error": "voice needs an image"}, 400)
+        if not end_image_path and data.get("end_image_key"):
+            for aa in SHACK.get("assets", []):
+                if aa["key"] == data["end_image_key"]:
+                    end_image_path = aa["file"]
+                    break
+        if end_image_path and not (image_path or key_paths):
+            return self._send({"error": "an ending frame needs a beginning frame too"}, 400)
 
         target_ratio = None
         if auto_aspect:
@@ -1471,6 +1506,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ref_mode": ref_mode, "zoom": zoom, "focus": focus,
                 "image_path": image_path or (key_paths[0] if key_paths else None),
                 "image_paths": key_paths,
+                "end_image_path": end_image_path,
                 "voice_path": voice_path,
                 "backend": CONFIG["backend"],
                 # gated jobs wait for the user's tap; everything else queues
@@ -1504,6 +1540,7 @@ class Handler(BaseHTTPRequestHandler):
                                      "has_image", "has_voice", "created",
                                      "started", "finished")}
         pub["ref_count"] = len(_ref_paths(j))
+        pub["has_end"] = bool(j.get("end_image_path"))
         pr = _PROGRESS.get(j.get("id"))
         if pr and j.get("status") == "rendering" and time.time() - pr["ts"] < 300:
             pub["progress"] = pr

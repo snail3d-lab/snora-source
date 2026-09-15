@@ -119,6 +119,19 @@ launchctl load ~/Library/LaunchAgents/com.example.snorabot.plist
   YOUR world once you fill in the manifest.
 - License: see `LICENSE.md`.
 
+## Begin→end generation (two pictures, one morph)
+
+`POST /jobs` accepts an optional `end_image` (data URL) or `end_image_key`
+(library). With a beginning frame present, the render morphs exactly:
+frame 0 = the begin picture, final frame = the end picture. The FL2VA model
+handles the motion; the prompt describes the journey between.
+
+The mode needs one extra pipeline file on the farm: copy
+`backend/pipelines/minimax-h3-begin-end-to-video.vpipeline` into your vpipe
+`pipelines/` directory (it is the stock first-last pipeline with a SECOND
+`load-image` stage wired to the final frame). Without it the job fails with a
+vpipe stage error, and everything else is unaffected.
+
 ## Live progress, ETA, and the phone viewer
 
 While a job is `rendering`, `/jobs` and `/jobs/<id>` include:
