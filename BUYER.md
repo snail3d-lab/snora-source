@@ -118,3 +118,24 @@ launchctl load ~/Library/LaunchAgents/com.example.snorabot.plist
   deployment is a placeholder or generic on purpose — the prompts describe
   YOUR world once you fill in the manifest.
 - License: see `LICENSE.md`.
+
+## Live progress, ETA, and the phone viewer
+
+While a job is `rendering`, `/jobs` and `/jobs/<id>` include:
+
+```json
+"progress": {"pct": 40, "stage": "denoise", "eta": 681, "ts": 1789454343.4}
+```
+
+`pct` is per-stage (the engine restarts 0-100 each pipeline stage), `eta` is
+seconds left in that stage, derived from the last two samples. The Discord
+bot draws it as a live bar; the iOS app draws it on the job card.
+
+**Any-browser / Android client out of the box:** open `http://YOUR-FARM:7789/view`,
+enter the farm URL + secret once — queue, progress bars, ETA and tap-to-play
+delivery of finished clips (`GET /video/<id>.mp4`, `X-Sora-Secret` header
+required; the page is inert without your secret). On Android, Chrome →
+menu → *Add to Home screen*. A future native Android port should reuse the
+same three fields (`pct`, `stage`, `eta`) on its job cards and `/video/<id>.mp4`
+for delivery — that is the intended parity contract with the iOS app.
+

@@ -2,6 +2,22 @@ import AVFoundation
 import Foundation
 import UIKit
 
+struct JobProgress: Codable {
+    let pct: Int?
+    let stage: String?
+    let eta: Int?
+
+    var clamped: Double { Double(max(0, min(100, pct ?? 0))) }
+
+    /// honest ETA: the farm's percentages restart each pipeline step,
+    /// so this reads “seconds left in THIS step”
+    var etaText: String? {
+        guard let e = eta, e >= 0 else { return nil }
+        return e >= 60 ? String(format: "~%dm%02ds left", e / 60, e % 60)
+                       : "~\(e)s left"
+    }
+}
+
 struct Job: Identifiable, Codable {
     let id: String
     let prompt: String

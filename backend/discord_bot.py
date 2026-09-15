@@ -591,7 +591,12 @@ class SnoraClient(discord.Client):
                     f"{job.get('quality')} — usually a few minutes.")
         pct = max(0, min(100, int(p.get("pct", 0))))
         bar = "▰" * (pct // 10) + "▱" * (10 - pct // 10)
-        return (f"🎬 **Rendering** {bar} **{pct}%** — {str(p.get('stage', ''))[:40]}"
+        eta = p.get("eta")
+        eta_txt = ""
+        if isinstance(eta, (int, float)) and eta >= 0:
+            mn, sec = divmod(int(eta), 60)
+            eta_txt = f" · ~{mn}m{sec:02d}s left" if mn else f" · ~{sec}s left"
+        return (f"🎬 **Rendering** {bar} **{pct}%** — {str(p.get('stage', ''))[:40]}{eta_txt}"
                 f"\n_({job.get('duration')}s · {job.get('aspect')} · {job.get('quality')})_")
 
     async def watch_job(self, jid, plan, ch, ack, user, w):

@@ -511,8 +511,7 @@ def _render_vpipe(job):
             lines.append(ln)
             m = _PROGRESS_RE.match(ln)
             if m:
-                _PROGRESS[job["id"]] = {"pct": int(m.group(1)),
-                                        "stage": m.group(2), "ts": time.time()}
+                _progress_update(job["id"], int(m.group(1)), m.group(2))
 
     drainer = threading.Thread(target=_drain, daemon=True)
     drainer.start()
@@ -542,6 +541,23 @@ def _render_vpipe(job):
 # and the Discord bot can draw a bar. In-memory only — nobody needs it persisted.
 _PROGRESS = {}
 _PROGRESS_RE = re.compile(r"^\[PROGRESS\] (\d+)% of '([^']+)' completed")
+
+
+def _progress_update(job_id, pct, stage):
+    """pct is PER-STAGE (engine restarts it each phase), so the ETA we derive
+    is 'seconds left in this stage' — honest, and all the UI needs. Two samples
+    of the same stage give the rate; a stage change resets the clock."""
+    now = time.time()
+    prev = _PROGRESS.get(job_id) or {}
+    eta = None
+    if (prev.get("stage") == stage and pct > prev.get("pct", -1)
+            and now > prev.get("ts", 0)):
+        rate = (pct - prev["pct"]) / (now - prev["ts"])   # % per second
+        if rate > 0:
+            eta = round((100 - pct) / rate)
+    elif prev.get("stage") == stage and prev.get("eta"):
+        eta = prev["eta"]          # keep last estimate until a better one lands
+    _PROGRESS[job_id] = {"pct": pct, "stage": stage, "ts": now, "eta": eta}
 
 POST_QUEUE = []
 _post_wake = threading.Event()
@@ -1017,6 +1033,21 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     info["comfy"] = "down"
             return self._send(info)
+        if path == "/view":
+            # phone viewer (Android/any-browser client). The page itself is
+            # inert; every API call it makes still needs the secret header.
+            try:
+                html = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "snora_viewer.html"), "rb").read()
+            except OSError:
+                return self._send({"error": "viewer not installed"}, 404)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(html)
+            return
         if not self._authed():
             return self._send({"error": "unauthorized"}, 401)
         with _lock:
@@ -1064,6 +1095,34 @@ class Handler(BaseHTTPRequestHandler):
             if not job:
                 return self._send({"error": "not found"}, 404)
             return self._send(self._public(job))
+        m = re.fullmatch(r"/video/([a-z0-9_]+)(?:\.mp4)?", path)
+        if m:
+            # farm-direct clip playback (buyers without a Cloudflare worker,
+            # and the /view phone client). Auth required, id-locked, jailed
+            # to the sandbox dir.
+            base = os.path.realpath(CONFIG["vpipe_sandbox"])
+            stem = m.group(1)
+            p = None
+            for name in (stem + ".mp4", stem + "_exact.mp4", "dc_" + stem + ".mp4"):
+                cand = os.path.realpath(os.path.join(base, "sora", name))
+                if cand.startswith(base + os.sep) and os.path.isfile(cand):
+                    p = cand
+                    break
+            if not p:
+                return self._send({"error": "not found"}, 404)
+            size = os.path.getsize(p)
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Accept-Ranges", "none")
+            self.end_headers()
+            with open(p, "rb") as fh:
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            return
         return self._send({"error": "not found"}, 404)
 
     def do_POST(self):

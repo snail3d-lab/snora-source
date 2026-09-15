@@ -368,12 +368,32 @@ struct JobRow: View {
                 }
             }
             if job.isWorking {
-                HStack(spacing: 8) {
-                    BlinkDot()
-                    Text(job.status == "rendering" ? "the farm is on air…" : "in the queue…")
-                        .font(.caption).foregroundStyle(Theme.sand)
-                    Spacer()
-                    ProgressView().scaleEffect(0.8).tint(Theme.signal)
+                if job.status == "rendering", let p = job.progress, p.pct != nil {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            BlinkDot()
+                            Text("the farm is on air — \(p.stage ?? "rendering")")
+                                .font(.caption).foregroundStyle(Theme.sand).lineLimit(1)
+                            Spacer()
+                            Text("\u{25B0}\u{25B1} \(Int(p.clamped))%")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(Theme.sand)
+                        }
+                        ProgressView(value: p.clamped, total: 100)
+                            .tint(Theme.signal)
+                        if let eta = p.etaText {
+                            Text(eta).font(.caption2)
+                                .foregroundStyle(Theme.sand.opacity(0.7))
+                        }
+                    }
+                } else {
+                    HStack(spacing: 8) {
+                        BlinkDot()
+                        Text(job.status == "rendering" ? "the farm is on air…" : "in the queue…")
+                            .font(.caption).foregroundStyle(Theme.sand)
+                        Spacer()
+                        ProgressView().scaleEffect(0.8).tint(Theme.signal)
+                    }
                 }
             }
             // short version on a closed card; the full story is inside

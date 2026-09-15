@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#100d0a">
+<title>sNora farm</title>
+<style>
+  :root { --bg:#100d0a; --card:#1c1712; --sand:#e8dcc8; --dim:#a89878; --sig:#ff8a3c; --line:#3a2f24; }
+  * { box-sizing:border-box; } body { background:var(--bg); color:var(--sand);
+  font:15px/1.45 -apple-system,"Segoe UI",Roboto,sans-serif; margin:0; padding:14px; }
+  h1 { font-size:19px; margin:2px 0 14px; } h1 span{color:var(--sig);}
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px;
+          padding:12px 14px; margin:0 0 10px; }
+  .chip { display:inline-block; font-size:11px; padding:1px 8px; border-radius:99px;
+          border:1px solid var(--line); color:var(--dim); margin-bottom:6px; }
+  .chip.rendering{color:var(--sig);border-color:var(--sig);}
+  .chip.done{color:#7ddc8b;border-color:#7ddc8b;}
+  .chip.failed{color:#ff6b6b;border-color:#ff6b6b;}
+  .bar { color:var(--sig); letter-spacing:1px; }
+  .stage { color:var(--dim); font-size:13px; }
+  .eta { color:var(--dim); font-size:12px; }
+  .prompt{font-size:13.5px;} .dim{color:var(--dim);font-size:12px;}
+  button { background:none;border:1px solid var(--sig);color:var(--sig);
+           border-radius:10px;padding:6px 12px;font-size:13px;margin-top:8px; }
+  video { width:100%; border-radius:10px; margin-top:8px; background:#000; }
+  input { width:100%; padding:10px; margin:6px 0; border-radius:10px;
+          border:1px solid var(--line); background:#141010; color:var(--sand); }
+</style>
+</head>
+<body>
+<h1>sNora <span>farm</span> <button style="float:right;margin:0;padding:4px 10px" onclick="cfg()">setup</button></h1>
+<div id="list"></div>
+<script>
+let BASE = localStorage.getItem('snora_base') || '', SEC = localStorage.getItem('snora_sec') || '';
+function cfg(){
+  const b = prompt('farm URL (e.g. http://192.168.1.20:7789)', BASE); if (b===null) return;
+  const s = prompt('farm secret', SEC); if (s===null) return;
+  localStorage.setItem('snora_base', b.trim()); localStorage.setItem('snora_sec', s.trim());
+  BASE=b.trim(); SEC=s.trim(); tick();
+}
+async function api(p){
+  const r = await fetch(BASE+p,{headers:{'X-Sora-Secret':SEC}});
+  if (r.status===401) throw new Error('bad secret — tap setup');
+  return r.json();
+}
+const esc = t => (t||'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function etaTxt(e){ if (e==null||e<0) return ''; return e>=60 ? `~${Math.floor(e/60)}m${String(e%60).padStart(2,'0')}s left` : `~${e}s left`; }
+function card(j){
+  let h = `<div class="card"><span class="chip ${j.status}">${j.status}</span>`;
+  if (j.source) h += ` <span class="chip">${esc(j.source)}</span>`;
+  h += `<div class="prompt">${esc(j.prompt)}</div>`;
+  if (j.status==='rendering'){
+    const p=j.progress||{}; const pct=Math.max(0,Math.min(100,p.pct||0));
+    if (p.pct!=null){
+      h += `<div><span class="bar">${'▰'.repeat(pct/10|0)}${'▱'.repeat(10-(pct/10|0))} ${pct}%</span>
+            <span class="stage"> ${esc(p.stage||'')}</span> <span class="eta">${etaTxt(p.eta)}</span></div>`;
+    } else h += `<div class="stage">the farm is on air…</div>`;
+  } else if (j.status==='queued'){
+    h += `<div class="stage">in the queue…</div>`;
+  } else if (j.status==='failed'){
+    h += `<div class="eta">${esc(j.error||'')}</div>`;
+  } else if (j.status==='done'){
+    h += `<button onclick="play(this,'${j.id}')">▶ play</button><div></div>`;
+  }
+  h += `<div class="dim">${j.id} · ${j.duration||'?'}s · ${j.aspect||''} ${j.quality||''}</div></div>`;
+  return h;
+}
+async function play(btn,id){
+  btn.disabled = true; btn.textContent = 'loading…';
+  const r = await fetch(`${BASE}/video/${id}.mp4`,{headers:{'X-Sora-Secret':SEC}});
+  if (!r.ok){ btn.textContent='video not on this farm'; btn.disabled=false; return; }
+  const url = URL.createObjectURL(await r.blob());
+  btn.parentElement.querySelector('div').innerHTML = `<video src="${url}" controls playsinline></video>`;
+  btn.remove();
+}
+async function tick(){
+  if (!BASE||!SEC){ document.getElementById('list').innerHTML =
+    '<div class="card">point me at your farm: <b>setup</b> (top right)<br>' +
+    '<span class="dim">farm URL + the secret from your sora_config.json</span></div>'; return; }
+  try{
+    const {jobs} = await api('/jobs');
+    jobs.sort((a,b)=>(b.created||0)-(a.created||0));
+    document.getElementById('list').innerHTML = jobs.slice(0,50).map(card).join('') ||
+      '<div class="card dim">no jobs yet</div>';
+  }catch(e){ document.getElementById('list').innerHTML = `<div class="card eta">${esc(e.message)}</div>`; }
+}
+tick(); setInterval(tick, 5000);
+</script>
+</body>
+</html>
