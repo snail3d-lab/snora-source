@@ -162,3 +162,7 @@ menu → *Add to Home screen*. A future native Android port should reuse the
 same three fields (`pct`, `stage`, `eta`) on its job cards and `/video/<id>.mp4`
 for delivery — that is the intended parity contract with the iOS app.
 
+## Access and updates
+
+Send your GitHub username to **snailmail3d@gmail.com** and you'll be added to
+this repo. Updates land here, so `git pull`. Questions to the same address.
