@@ -132,6 +132,32 @@ enum StudioAPI {
         return try await post("generate-qwen", body: body, timeout: 900)
     }
 
+    /// Qwen edit sized to the input picture's own aspect, so the frame is kept.
+    static func qwenEditSize(for image: UIImage, target: Int = 1536) -> (w: Int, h: Int) {
+        let ar = image.size.width / max(1, image.size.height)
+        let w: Int, h: Int
+        if ar >= 1 { w = target; h = Int((Double(target) / Double(ar)).rounded()) }
+        else       { h = target; w = Int((Double(target) * Double(ar)).rounded()) }
+        func snap(_ v: Int) -> Int { max(512, Int((Double(v) / 32).rounded()) * 32) }
+        return (snap(w), snap(h))
+    }
+
+    /// Qwen-Image-2.1 edit: the annotated picture is the single reference and the
+    /// canvas follows its aspect (a circle drawn on the photo, described in words).
+    static func generateQwenEdit(image: UIImage, prompt: String,
+                                 steps: Int = 40, seed: Int = -1) async throws -> StudioGenResult
+    {
+        let s = qwenEditSize(for: image)
+        guard let png = image.pngData() else {
+            throw StudioError(status: nil, detail: "couldn't encode the picture")
+        }
+        return try await post("generate-qwen", body: [
+            "prompt": prompt, "width": s.w, "height": s.h, "steps": steps, "seed": seed,
+            "transparent": false,
+            "images": ["data:image/png;base64," + png.base64EncodedString()],
+        ], timeout: 900)
+    }
+
     /// GET {host}/generated/<name> → UIImage (the studio serves these as static files)
     static func fetchImage(path: String) async throws -> UIImage {
         var p = path

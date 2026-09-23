@@ -90,7 +90,7 @@ private struct PhotoCell: View {
 }
 
 /// thumbnail from the local file; auto-fetches from the studio when missing
-private struct LocalPhotoThumb: View {
+struct LocalPhotoThumb: View {
     let record: PhotoRecord
     @ObservedObject private var store = PhotoStore.shared
     @State private var img: UIImage?
@@ -125,13 +125,14 @@ private struct LocalPhotoThumb: View {
 }
 
 /// ── tap a photo: full image + USE FOR VIDEO / SAVE / DELETE ────────────
-private struct PhotoDetailSheet: View {
+struct PhotoDetailSheet: View {
     let record: PhotoRecord
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var store = PhotoStore.shared
     @ObservedObject private var bridge = PhotoBridge.shared
     @State private var img: UIImage?
     @State private var note = ""
+    @State private var showEdit = false
 
     var body: some View {
         ZStack {
@@ -166,6 +167,16 @@ private struct PhotoDetailSheet: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal)
                 Button {
+                    showEdit = true
+                } label: {
+                    Label("CHANGE IT", systemImage: "wand.and.stars")
+                        .kerning(1.2)
+                        .font(.system(.body, design: .monospaced).weight(.bold))
+                }
+                .buttonStyle(SignalButtonStyle())
+                .disabled(img == nil)
+                .padding(.horizontal)
+                Button {
                     bridge.pendingReference = img   // RootView switches to Create
                     dismiss()
                 } label: {
@@ -173,7 +184,7 @@ private struct PhotoDetailSheet: View {
                         .kerning(1.2)
                         .font(.system(.body, design: .monospaced).weight(.bold))
                 }
-                .buttonStyle(SignalButtonStyle())
+                .buttonStyle(GhostButtonStyle())
                 .disabled(img == nil)
                 .padding(.horizontal)
                 HStack(spacing: 10) {
@@ -197,6 +208,9 @@ private struct PhotoDetailSheet: View {
             .padding(.top, 8)
         }
         .task(id: record.id) { img = await store.imageWithRemoteFallback(record) }
+        .sheet(isPresented: $showEdit) {
+            if let img { PhotoEditView(initialImage: img, sourceRecord: record) }
+        }
     }
 
     private func saveToLibrary() {
@@ -289,7 +303,7 @@ private struct SettingsSheet: View {
 }
 
 /// "3 min. ago" style stamp for the grid
-private func relativeTime(_ date: Date) -> String {
+func relativeTime(_ date: Date) -> String {
     let f = RelativeDateTimeFormatter()
     f.unitsStyle = .abbreviated
     return f.localizedString(for: date, relativeTo: Date())

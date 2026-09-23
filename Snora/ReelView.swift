@@ -30,13 +30,43 @@ struct RootView: View {
     }
 }
 
-/// ── the reel: every clip, newest first ────────────────────────────────
+/// what the reel is showing: everything, only in-flight jobs, or only stills
+enum ReelFilter { case all, cooking, stills }
+
+/// one row in the unified reel — a rendered clip or a studio still
+enum FeedItem: Identifiable {
+    case clip(Job)
+    case still(PhotoRecord)
+
+    var id: String {
+        switch self {
+        case .clip(let j):  return "clip-\(j.id)"
+        case .still(let p): return "still-\(p.id.uuidString)"
+        }
+    }
+    var created: Double {
+        switch self {
+        case .clip(let j):  return j.created ?? 0
+        case .still(let p): return p.createdAt.timeIntervalSince1970
+        }
+    }
+    var prompt: String {
+        switch self {
+        case .clip(let j):  return j.prompt
+        case .still(let p): return p.prompt
+        }
+    }
+}
+
+/// ── the reel: every clip and still, newest first ──────────────────────
 struct ReelView: View {
     let token = API.token
     @StateObject var poller = Poller.shared
+    @ObservedObject private var photoStore = PhotoStore.shared
     @State private var jobs: [Job] = []
-    @State private var showWorking = false
+    @State private var filter: ReelFilter = .all
     @State private var playing: Job?
+    @State private var selectedPhoto: PhotoRecord?
     @State private var query = ""
     @State private var farmNote: String?
     @State private var expandedIDs: Set<String> = []
@@ -45,13 +75,19 @@ struct ReelView: View {
     @State private var deleteTarget: Job?
     @State private var queueNote: String?
 
-    var visible: [Job] {
-        // ALL shows everything — failed jobs included, because they now explain
-        // themselves. COOKING narrows to what's queued or rendering.
-        var list = showWorking ? jobs.filter { $0.isWorking } : jobs
+    /// the reel shows both halves of what the assistant makes: rendered clips
+    /// from the farm and stills from the studio, newest first. ALL keeps failed
+    /// jobs too — they explain themselves. COOKING narrows to what's in flight.
+    var feed: [FeedItem] {
+        var items: [FeedItem]
+        switch filter {
+        case .all:      items = jobs.map { .clip($0) } + photoStore.photos.map { .still($0) }
+        case .cooking:  items = jobs.filter { $0.isWorking }.map { .clip($0) }
+        case .stills:   items = photoStore.photos.map { .still($0) }
+        }
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
-        if !q.isEmpty { list = list.filter { $0.prompt.lowercased().contains(q) } }
-        return list
+        if !q.isEmpty { items = items.filter { $0.prompt.lowercased().contains(q) } }
+        return items.sorted { $0.created > $1.created }
     }
 
     /// how many jobs are sitting in line — the "clear queue" offer and its
@@ -64,9 +100,9 @@ struct ReelView: View {
         NavigationStack {
             ZStack {
                 SnoraBackground()
-                if jobs.isEmpty {
+                if jobs.isEmpty && photoStore.photos.isEmpty {
                     emptyState
-                } else if visible.isEmpty {
+                } else if feed.isEmpty {
                     VStack(spacing: 10) {
                         Image(systemName: "magnifyingglass").font(.title)
                             .foregroundStyle(Theme.sand.opacity(0.6))
@@ -76,35 +112,49 @@ struct ReelView: View {
                     }
                     .padding()
                 } else {
-                    List(visible) { job in
-                        JobRow(job: job, token: token,
-                               expanded: expandedIDs.contains(job.id),
-                               onTap: { playing = job },
-                               onToggle: { flip(job.id) },
-                               onUnqueue: { Task { await unqueue(job.id) } },
-                               onStop: { stopTarget = job },
-                               onDelete: { deleteTarget = job })
-                            .listRowSeparator(.hidden)
-                            .listRowBackground(Color.clear)
-                            .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
-                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                if job.status == "queued" {
-                                    Button(role: .destructive) {
-                                        Task { await unqueue(job.id) }
-                                    } label: { Label("unqueue", systemImage: "slash.circle") }
-                                        .tint(Theme.ember)
-                                } else if job.status == "rendering" {
-                                    // stopping a drawing is deliberate — confirm first
-                                    Button(role: .destructive) {
-                                        stopTarget = job
-                                    } label: { Label("stop render", systemImage: "stop.circle.fill") }
-                                        .tint(Theme.ember)
-                                } else {
-                                    Button(role: .destructive) {
-                                        Task { await destroy(job.id) }
-                                    } label: { Label("delete", systemImage: "trash") }
+                    List(feed) { item in
+                        switch item {
+                        case .clip(let job):
+                            JobRow(job: job, token: token,
+                                   expanded: expandedIDs.contains(job.id),
+                                   onTap: { playing = job },
+                                   onToggle: { flip(job.id) },
+                                   onUnqueue: { Task { await unqueue(job.id) } },
+                                   onStop: { stopTarget = job },
+                                   onDelete: { deleteTarget = job })
+                                .listRowSeparator(.hidden)
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                    if job.status == "queued" {
+                                        Button(role: .destructive) {
+                                            Task { await unqueue(job.id) }
+                                        } label: { Label("unqueue", systemImage: "slash.circle") }
+                                            .tint(Theme.ember)
+                                    } else if job.status == "rendering" {
+                                        // stopping a drawing is deliberate — confirm first
+                                        Button(role: .destructive) {
+                                            stopTarget = job
+                                        } label: { Label("stop render", systemImage: "stop.circle.fill") }
+                                            .tint(Theme.ember)
+                                    } else {
+                                        Button(role: .destructive) {
+                                            Task { await destroy(job.id) }
+                                        } label: { Label("delete", systemImage: "trash") }
+                                    }
                                 }
-                            }
+                        case .still(let rec):
+                            StillRow(record: rec, onTap: { selectedPhoto = rec })
+                                .listRowSeparator(.hidden)
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                    Button(role: .destructive) {
+                                        withAnimation { photoStore.delete(rec) }
+                                    } label: { Label("delete", systemImage: "trash") }
+                                        .tint(Theme.ember)
+                                }
+                        }
                     }
                     .listStyle(.plain)
                     .scrollContentBackground(.hidden)
@@ -129,11 +179,14 @@ struct ReelView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     HStack(spacing: 6) {
-                        Chip(title: "ALL", selected: !showWorking, compact: true) {
-                            withAnimation { showWorking = false }
+                        Chip(title: "ALL", selected: filter == .all, compact: true) {
+                            withAnimation { filter = .all }
                         }
-                        Chip(title: "COOKING", selected: showWorking, compact: true) {
-                            withAnimation { showWorking = true }
+                        Chip(title: "COOKING", selected: filter == .cooking, compact: true) {
+                            withAnimation { filter = .cooking }
+                        }
+                        Chip(title: "STILLS", selected: filter == .stills, compact: true) {
+                            withAnimation { filter = .stills }
                         }
                     }
                 }
@@ -183,6 +236,7 @@ struct ReelView: View {
                 Text(queueNote ?? "")
             }
             .sheet(item: $playing) { job in PlayerSheet(job: job, token: token) }
+            .sheet(item: $selectedPhoto) { rec in PhotoDetailSheet(record: rec) }
             .task { await load(); poller.start(token: token) }
         }
         .preferredColorScheme(.dark)
@@ -256,6 +310,48 @@ struct ReelView: View {
     private func load() async {
         jobs = (try? await API.jobs(token: token)) ?? jobs
         await poller.check(token: token)
+        _ = await photoStore.syncMissing()
+    }
+}
+
+/// ── one studio still in the reel: thumb, prompt, engine, age ──────────
+struct StillRow: View {
+    let record: PhotoRecord
+    var onTap: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button(action: onTap) {
+                HStack(alignment: .top, spacing: 8) {
+                    Text(record.prompt)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(Theme.cream)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                    Spacer(minLength: 4)
+                    MetaTag(text: "STILL")
+                }
+            }
+            .buttonStyle(.plain)
+            HStack(spacing: 6) {
+                MetaTag(text: record.engine)
+                Spacer(minLength: 0)
+                Text(relativeTime(record.createdAt))
+                    .font(.snoraLabel)
+                    .foregroundStyle(Theme.sand.opacity(0.85))
+            }
+            LocalPhotoThumb(record: record)
+                .frame(height: 190)
+                .frame(maxWidth: .infinity)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.cardStroke, lineWidth: 1))
+                .contentShape(Rectangle())
+                .onTapGesture { onTap() }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .snoraCard()
+        .padding(.vertical, 4)
     }
 }
 
@@ -325,6 +421,9 @@ struct JobRow: View {
                 }
                 if job.has_voice == true {
                     MetaIcon(system: "mic.fill")
+                }
+                if job.fromDiscord {
+                    MetaTag(text: job.discordUser.map { "DISCORD · \($0)" } ?? "DISCORD")
                 }
                 if job.has_end == true {
                     MetaTag(text: "BEGIN\u{2192}END")
@@ -479,6 +578,8 @@ struct PlayerSheet: View {
     @State private var saving = false
     @State private var saved = false
     @State private var shareURL: URL?
+    @State private var continuing = false
+    @State private var continueFrame: FrameImage?
 
     var body: some View {
         ZStack {
@@ -536,6 +637,20 @@ struct PlayerSheet: View {
                     ProgressView().tint(Theme.signal).frame(height: 200)
                 }
                 Text(job.prompt).font(.footnote).foregroundStyle(Theme.sand).padding(.horizontal)
+                Button { grabLastFrame() } label: {
+                    HStack(spacing: 8) {
+                        if continuing {
+                            ProgressView().tint(Theme.cream).scaleEffect(0.8)
+                        } else {
+                            Image(systemName: "arrow.uturn.forward.circle")
+                        }
+                        Text("CONTINUE FROM THIS SHOT").kerning(1.2)
+                    }
+                    .font(.system(.body, design: .monospaced).weight(.bold))
+                }
+                .buttonStyle(GhostButtonStyle())
+                .disabled(continuing)
+                .padding(.horizontal)
                 Spacer()
             }
             .padding(.top, 8)
@@ -544,6 +659,9 @@ struct PlayerSheet: View {
             if let u = shareURL {
                 ShareSheet(items: [u])
             }
+        }
+        .sheet(item: $continueFrame) { frame in
+            PhotoEditView(initialImage: frame.image)
         }
         .task { start() }
     }
@@ -604,6 +722,41 @@ struct PlayerSheet: View {
             }
         }
     }
+
+    /// pull the clip's last frame and open the editor on it — “carry on from here”
+    private func grabLastFrame() {
+        guard !continuing else { return }
+        continuing = true
+        err = nil
+        Task {
+            do {
+                let u = try await API.videoFile(token: token, id: job.id, remote: job.url ?? "")
+                let img = try await lastFrame(of: u)
+                continueFrame = FrameImage(image: img)
+            } catch {
+                err = "couldn't grab the last frame — \(error.localizedDescription)"
+            }
+            continuing = false
+        }
+    }
+
+    private func lastFrame(of url: URL) async throws -> UIImage {
+        let asset = AVURLAsset(url: url)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter = .zero
+        let dur = try await asset.load(.duration)
+        let t = CMTimeSubtract(dur, CMTime(value: 1, timescale: 30))
+        let cg = try await gen.image(at: t).image
+        return UIImage(cgImage: cg)
+    }
+}
+
+/// a UIImage with an identity, so it can ride a `.sheet(item:)`
+struct FrameImage: Identifiable {
+    let id = UUID()
+    let image: UIImage
 }
 
 /// ── the system share sheet ────────────────────────────────────────────
