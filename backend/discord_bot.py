@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sNora Discord bot — @sNora <idea> in your Discord server → render farm → clip back in chat.
+"""sNora Discord bot — @sNora <idea> in your Discord server → render farm → media back in chat.
 
 Runs beside the render service
 (sora_service.py on :7789, launched by your service manager).
@@ -46,6 +46,7 @@ DEFAULTS = {
     "nanny_off_guilds": [],       # server IDs with the PG gate OFF (private adult channels)
     "owner_ids": [],              # user IDs (the operator + helpers): no nanny, no spam guards
     "snora_token": "",            # R2 fallback fetch (X-Sora-Token)
+    "studio_url": "http://127.0.0.1:7778",  # SnailStudio AI-engine host (Qwen stills)
 }
 
 DURATIONS = {3, 4, 5, 8, 10, 15}
@@ -58,6 +59,31 @@ SPOKEN_RE = re.compile(r'["“”]([^"“”]{3,})["“”]')
 D_TAG_RE = re.compile(r"<d>(.*?)</d>", re.S)
 SHAPE_WORDS = re.compile(r"\b(wide|16:9|landscape|square|1:1|portrait|vertical|tall|"
                          r"9:16|4:3|3:4|horizontal)\b", re.I)
+
+# ── still-image lane (Qwen-Image-2.1) ────────────────────────────────────
+# The video farm is the default; a member asking for a picture / sticker / logo /
+# poster / meme, or handing over a photo to edit, routes to SnailStudio instead.
+IMAGE_INTENT_RE = re.compile(
+    r"\b(image|images|picture|pictures|pic|pics|photo|photos|sticker|stickers|still|"
+    r"illustration|drawing|artwork|logo|poster|meme|thumbnail|icon|avatar|wallpaper)\b", re.I)
+IMAGE_VERBS_RE = re.compile(r"\b(make|create|generate|draw|paint|design|give me|show me|"
+                            r"need|want|edit|change|turn|add|remove|photoshop)\b", re.I)
+VIDEO_HINT_RE = re.compile(r"\b(video|clip|film|movie|animate|animation|motion|move|moving|"
+                           r"reel|sora|h3|voice|sound|song|sing|frame)\b", re.I)
+
+
+def image_intent(text):
+    """True when the member clearly wants a still picture, not a clip.
+    Asks that mention video words stay on the film lane."""
+    text = (text or "").strip()
+    if not text or VIDEO_HINT_RE.search(text):
+        return False
+    if IMAGE_INTENT_RE.search(text) and (
+            IMAGE_VERBS_RE.search(text)
+            or re.match(r"^\s*(a|an|the)?\s*\b(image|picture|photo|sticker|logo|poster|"
+                        r"illustration|drawing)\b", text, re.I)):
+        return True
+    return bool(re.search(r"\b(sticker|stickers)\b", text, re.I))
 
 # ── nanny layer: cheap deterministic gate, runs before the LLM or the GPU ──
 
@@ -109,11 +135,12 @@ def load_cfg():
     except (FileNotFoundError, json.JSONDecodeError):
         sc = {}
     cfg["secret"] = sc.get("secret", "")
-    cfg["worker_base"] = sc.get("worker_base", "https://your-frontend.example.com")
+    cfg["worker_base"] = sc.get("worker_base", "https://snail3d.com")
     cfg["vpipe_sandbox"] = sc.get("vpipe_sandbox", f"{HOME}/vpipe/sandbox")
     cfg["llm_base"] = sc.get("snail_api_base", "")
     cfg["llm_key"] = sc.get("snail_api_key", "")
     cfg["llm_model"] = sc.get("snail_model", "snail-top")
+    cfg["studio_url"] = sc.get("studio_url", DEFAULTS["studio_url"])
     cfg.update(sc.get("discord") or {})
     return cfg
 
@@ -122,17 +149,32 @@ CFG = load_cfg()
 
 
 def _load_library():
-    """The Discord-facing slice of the owner's reference manifest. Ship your OWN
-    keys in shack_manifest.json and mark the ones safe for public use with
-    "discord_ok": true; only those are offered to Discord members, so personal
-    or private references stay out of the community's reach."""
+    """The Discord-safe slice of the studio reference manifest: only the mascot
+    characters and the bare sets. The operator's own photos, poses, attire and
+    likenesses are deliberately invisible to Discord members."""
+    keep = ["baby_snail_canonical", "baby_snail_sheet", "shack_wide",
+            "shack_computer_corner", "prop_bambu_p2s", "ref_shack_day"]
+    scrub = {
+        "baby_snail_canonical": "BABY SNAIL hero shot: the server's tiny mascot — NOT an "
+                                "actual snail. A six-inch Pixar-style toy figure of a bearded "
+                                "man (NY cap, gray sherpa robe, slides), full body, hands on "
+                                "hips, content expression",
+        "baby_snail_sheet": "BABY SNAIL model sheet: six views of the same six-inch toy "
+                            "figure (bearded man, NY cap) on a neutral warm-gray background",
+    }
     try:
         with open(os.path.join(HERE, "shack_manifest.json")) as f:
             sh = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return []
-    return [{"key": a["key"], "desc": a.get("desc", a["key"])}
-            for a in sh.get("assets", []) if a.get("discord_ok")]
+    by_key = {a["key"]: a for a in sh.get("assets", [])}
+    out = []
+    for k in keep:
+        if k not in by_key:
+            continue
+        desc = scrub.get(k, re.sub(r"the host'?s? ?", "the snail ", by_key[k].get("desc", "")))
+        out.append({"key": k, "desc": desc})
+    return out
 
 
 LIBRARY = _load_library()
@@ -177,11 +219,65 @@ def farm_submit(payload, user_id):
             return e.code, {"error": str(e)}
 
 
+async def collect_images(attachments):
+    """Discord attachments -> (base64 image data URLs, skipped names).
+    HEIC (iPhone) is converted here; the farm and the studio only eat png/jpg/webp."""
+    imgs, skipped = [], []
+    for a in attachments:
+        ct, fn = a.content_type or "", (a.filename or "photo")
+        if ct not in ("image/png", "image/jpeg", "image/webp", "image/heic") \
+                or a.size > 10_000_000:
+            if ct.startswith("image/"):
+                skipped.append(fn)
+            continue
+        raw = await a.read()
+        if ct == "image/heic":
+            try:
+                import io
+
+                from PIL import Image
+                import pillow_heif
+                pillow_heif.register_heif_opener()
+                im = Image.open(io.BytesIO(raw)).convert("RGB")
+                im.thumbnail((1536, 1536))
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=88)
+                raw = buf.getvalue()
+            except Exception:
+                skipped.append(fn)
+                continue
+            ext = "jpg"
+        else:
+            ext = ct.split("/")[-1].replace("jpeg", "jpg")
+        imgs.append(f"data:image/{ext};base64," + base64.b64encode(raw).decode())
+    return imgs, skipped
+
+
+def _qwen_size_for(data_url, target=1536):
+    """Canvas for a Qwen edit: follow the attached picture's own aspect at
+    ~1536 on the long side, snapped to /32 (the engine's requirement)."""
+    try:
+        import io
+
+        from PIL import Image
+        raw = base64.b64decode(data_url.split("base64,", 1)[1])
+        w, h = Image.open(io.BytesIO(raw)).size
+        ar = w / max(1, h)
+        if ar >= 1:
+            tw, th = target, target / ar
+        else:
+            tw, th = target * ar, target
+        snap = lambda v: max(512, int(round(v / 32)) * 32)
+        return snap(tw), snap(th)
+    except Exception:
+        return 1024, 1024
+
+
 # ── LLM prompt formatter (the app's own snail-api lane) ──────────────────
 
 SYSTEM = (
     "You are sNora, the video-generation bot in this Discord community. A member gives you a "
-    "video idea; you turn it into ONE complete scene prompt for the owner's MiniMax H3 render farm "
+    "video idea; you turn it into ONE complete scene prompt for the MiniMax H3 render farm "
     "and a short friendly reply. You cannot render anything you haven't planned.\n\n"
     "THE HANDBOOK (condensed):\n"
     "- ONE shot per clip. Stage depth (foreground/midground/background) instead of cutting.\n"
@@ -215,17 +311,19 @@ SYSTEM = (
     "line (within budget) and the shot MUST have a picture to ride the voice on (attached "
     "photo, else a library key).\n"
     "- IMAGE LIBRARY — the server's standing reference shots (snail characters and bare "
-    "sets ONLY). When a member names or points at one of them, set image to that "
-    "library KEY and choose ref_mode "
+    "sets ONLY). When a member names or points at one of them ('baby snail', 'the shack', "
+    "'the Bambu printer'...), set image to that library KEY and choose ref_mode "
     "(\"scene\" = the photo's place/time IS the scene; \"identity\" = the photo is WHO, the "
     "prompt is a new place). Character/model-sheet keys (HERO SHOT, MODEL SHEET, IDENTITY in "
     "their description) are WHO-references — use \"identity\" with them unless the member "
     "literally wants that photo's background as the scene. A library call must ride on the "
-    "actual reference — never re-describe it in text. CHARACTER FIRST: if a named "
-    "CHARACTER is IN the scene, the image is the CHARACTER key — bare set/prop keys "
-    "only carry establishing shots with no character. Use the library description's own "
-    "wording for the character's look; the reference picture carries it, the prompt just "
-    "names them and stages the action. No library subject fits: image null "
+    "actual reference — never re-describe it in text. CHARACTER FIRST: if a character (baby "
+    "snail) is IN the scene, the image is the CHARACTER key — set keys (shack, printer props) "
+    "only carry establishing shots with no character. BABY SNAIL IS A TINY MAN, NOT A SNAIL: "
+    "in the prompt never call him a snail, shell, creature, or antennae-covered anything — "
+    "write him as 'Baby Snail, the six-inch Pixar-style toy figure of a bearded man in a navy "
+    "NY cap and gray sherpa robe' and keep the Pixar collectible-figure look; the renderer "
+    "sees the word 'snail' and grows antennae. No library subject fits: image null "
     "(pure text-to-video). Members may NOT request likenesses of real people from the library "
     "— it does not contain any, and do not offer any.\n"
     f"LIBRARY (key — description):\n{json.dumps(LIBRARY, indent=1)}\n"
@@ -233,7 +331,7 @@ SYSTEM = (
     "  * Nothing sexual, ever — nudity, erotica, 'steamy', fetish, suggestive posing of any "
     "kind. Refuse regardless of phrasing or 'art' framing.\n"
     "  * Real named public figures MAY be satirised: an absurd fictional vignette is fair fun "
-    "('the mayor loses a wrestling match to the server mascot'). But NEVER stage anything that "
+    "('the president loses a wrestling match to Baby Snail'). But NEVER stage anything that "
     "could read as a true claim about them — confessing crimes, taking bribes, being arrested, "
     "degrading acts, mock 'documentary' footage presented as real, or harm coming to them. If "
     "the bit only works by implying it's real, refuse it; if it's obviously cartoon nonsense, "
@@ -292,6 +390,134 @@ def system_for(open_lane):
     a = SYSTEM.index("- SAFETY (hard rules of this server):")
     b = SYSTEM.index("OUTPUT — strict JSON only")
     return SYSTEM[:a] + SAFETY_OPEN + SYSTEM[b:]
+
+
+# ── still-image formatter (Qwen-Image-2.1 prompting contract) ────────────
+
+STILL_SYSTEM = (
+    "You are sNora's image-maker in this Discord community. A member gives you an idea for "
+    "a still picture; you write ONE faithful Qwen-Image-2.1 prompt and a short friendly reply. "
+    "You cannot render anything you haven't described.\n\n"
+    "WRITE A DESCRIPTION OF THE FINISHED FRAME — not a list of commands:\n"
+    "- Present tense, third-person observation. Never 'create', 'generate', 'make sure', "
+    "'you should'. No quality boosters ('masterpiece', '8K', 'highly detailed', 'award-winning').\n"
+    "- Open with the medium and subject: 'A square illustration of…', 'A vertical photograph of…'.\n"
+    "- PLACE EVERYTHING: 8–14 positional phrases that reach the corners, edges and centre "
+    "('in the upper-left corner', 'across the lower third'). About a third of the sentences "
+    "should open on a position.\n"
+    "- Walk the frame in order: background first, then the top band, left→centre→right, then "
+    "the bottom band; or subject-out for a single subject.\n"
+    "- Give the lighting its own sentence: source, direction, quality, and the shadows it casts.\n"
+    "- Name colour with a modifier (deep navy, muted olive, warm terracotta) and give the "
+    "material (brushed metal, coarse linen) — never the bare noun.\n"
+    "- Enumerate; never summarise. 'Several items' is a defect — write small counts as words.\n"
+    "- Hedge what you can't know ('appears to be'), and be flatly definite about what the "
+    "member fixed.\n"
+    "- Close on the whole frame in one sentence: 'The overall composition…'.\n"
+    "- Target ~15–20 sentences.\n\n"
+    "IF THE MEMBER ATTACHED A PICTURE you are EDITING it (mode 'edit'):\n"
+    "- Lead with the operation ('Change the background to…', 'Add a…', 'Remove the…').\n"
+    "- Name ONLY what changes and push it strong; everything unnamed stays put.\n"
+    "- Then ONE blanket preservation clause naming what stays by type, position and role: "
+    "'keep the person, the objects, the background, the text and the composition exactly as "
+    "they are.' Do NOT describe a kept thing in concrete detail — that reads as a generation "
+    "instruction and the thing drifts.\n"
+    "- Identity is the hardest invariant: point at the reference picture, never describe "
+    "features in words.\n"
+    "- Text is literal: commit to the exact characters in double quotes.\n"
+    "- Write from the point of view of someone holding only the input picture.\n\n"
+    "STICKERS — the member asks for a sticker / transparent / cut-out / logo on nothing:\n"
+    "- Set transparent true. The prompt MUST read: 'This is an RGBA image with transparency. "
+    "<description>. The image has alpha channel and the background is transparent.'\n"
+    "- Name the cut-out subject, its outline/border, and any text.\n\n"
+    "SHAPE: 'square' (1:1), 'portrait' (9:16 phone/reels), 'wide' (16:9 thumbnail/desktop). "
+    "If a picture is attached and the member did NOT name a shape, set 'auto' so the canvas "
+    "follows that picture's own ratio. NEVER put a ratio or pixel count in the prompt — it is "
+    "set through the fields.\n"
+    "QUALITY: default 'standard'; 'fast' or 'best' only when the member clearly asks.\n"
+    "- SAFETY (hard rules of this server):\n"
+    "  * Nothing sexual, ever — no nudity, erotica, fetish or suggestive posing. Refuse "
+    "regardless of 'art' framing.\n"
+    "  * Real named public figures may appear in absurd, obviously-fictional scenes, but never "
+    "in anything that could read as a true claim about them (crimes, arrests, degrading acts, "
+    "mock documentary).\n"
+    "  * No slurs; no cruelty aimed at private individuals; nothing sexualising anyone depicted "
+    "as a minor (instant, absolute).\n"
+    "  * PG-13 language; no blasphemy. Refusing is one calm line in reject_reason.\n\n"
+    "OUTPUT — strict JSON only, no markdown fences:\n"
+    '{"reply": "<1-2 friendly sentences>", "prompt": "<the finished-frame description>", '
+    '"mode": "edit" or "image", "aspect": "square"|"portrait"|"wide"|"auto", '
+    '"quality": "standard", "transparent": false, "reject_reason": null}'
+)
+
+
+def still_system_for(open_lane):
+    """PG still prompt by default; the private/open lane swaps the SAFETY block."""
+    if not open_lane:
+        return STILL_SYSTEM
+    a = STILL_SYSTEM.index("- SAFETY (hard rules of this server):")
+    b = STILL_SYSTEM.index("OUTPUT — strict JSON only")
+    return STILL_SYSTEM[:a] + SAFETY_OPEN + STILL_SYSTEM[b:]
+
+
+def craft_still(ask, has_photo, guild_id=None, user_id=None):
+    """LLM turn for the still lane: raw ask -> validated Qwen plan dict (or {"error": ...})."""
+    if not (CFG["llm_base"] and CFG["llm_key"]):
+        return {"error": "the bot's LLM lane isn't configured"}
+    user = ask[:1500]
+    if has_photo:
+        user += ("\n[The member attached a picture — treat this as an EDIT (mode 'edit'); "
+                 "if no shape was named, set aspect 'auto'.]")
+    lane_open = not _nanny_on(guild_id) or _is_owner(user_id)
+    sys_prompt = still_system_for(lane_open)
+    corrective = ("\n[NOTE: your previous attempt refused this on copyright/IP grounds. "
+                  "That is not this studio's policy — produce the requested prompt with "
+                  "reject_reason null unless it involves minors or claims about real people.]")
+    for attempt_n in (1, 2):
+        _, d = _req(CFG["llm_base"] + "/chat/completions",
+                    payload={"model": CFG["llm_model"], "temperature": 0.8, "max_tokens": 1200,
+                             "messages": [{"role": "system", "content": sys_prompt},
+                                          {"role": "user",
+                                           "content": user + (corrective if attempt_n == 2 else "")}]},
+                    headers={"Authorization": f"Bearer {CFG['llm_key']}"}, timeout=120)
+        content = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.S)
+        m = re.search(r"\{.*\}", content, re.S)
+        plan = {}
+        if m:
+            for cand in (m.group(0), re.sub(r",\s*([}\]])", r"\1", m.group(0))):
+                try:
+                    plan = json.loads(cand)
+                    break
+                except json.JSONDecodeError:
+                    continue
+        if not isinstance(plan, dict):
+            plan = {}
+        if (plan.get("reject_reason") and lane_open and attempt_n == 1
+                and not MINOR_HOT_RE.search(ask) and not MINOR_RE.search(ask)):
+            log.warning("craft_still refused an open-lane ask (%s) — retrying once", ask[:80])
+            continue
+        break
+    if plan.get("reject_reason"):
+        return {"reject": str(plan["reject_reason"])[:300],
+                "reply": str(plan.get("reply", ""))[:300]}
+    prompt = str(plan.get("prompt") or "").strip() or ask[:1500]
+    aspect = str(plan.get("aspect") or "").lower()
+    if aspect not in ("square", "portrait", "wide", "auto"):
+        aspect = "square"
+    if has_photo and aspect != "auto" and not SHAPE_WORDS.search(ask):
+        aspect = "auto"
+    if aspect == "auto" and not has_photo:
+        aspect = "square"
+    return {
+        "reply": str(plan.get("reply") or "Here it is!")[:300],
+        "prompt": prompt[:2500],
+        "mode": "edit" if has_photo else "image",
+        "aspect": aspect,
+        "quality": plan.get("quality") if plan.get("quality") in QUALITIES else DEFAULT_QUALITY,
+        "transparent": bool(plan.get("transparent", False))
+                       or bool(re.search(r"\bsticker\b", ask, re.I)),
+    }
 
 
 def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None):
@@ -385,6 +611,37 @@ def get_clip(jid):
     return tmp if os.path.getsize(tmp) > 1000 else None
 
 
+# ── still-image delivery (SnailStudio Qwen-Image-2.1) ────────────────────
+
+def studio_generate(payload):
+    """POST the Qwen still job to SnailStudio. Blocking — the worker holds the
+    call for the whole render — so always called via asyncio.to_thread."""
+    req = urllib.request.Request(
+        CFG["studio_url"].rstrip("/") + "/api/editor/ai/generate-qwen",
+        data=json.dumps(payload).encode(), method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=900) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode())
+        except Exception:
+            return e.code, {"error": str(e)}
+    except Exception as e:
+        return 0, {"error": str(e)}
+
+
+def get_still(ref, jid):
+    """Download a /generated/... PNG from SnailStudio to a local temp file."""
+    tmp = os.path.join("/tmp", f"snora_still_{jid}.png")
+    req = urllib.request.Request(CFG["studio_url"].rstrip("/") + ref,
+                                 headers={"User-Agent": BROWSER_UA})
+    with urllib.request.urlopen(req, timeout=180) as resp, open(tmp, "wb") as f:
+        f.write(resp.read())
+    return tmp if os.path.getsize(tmp) > 1000 else None
+
+
 # ── watch store: survives bot restarts so in-flight jobs still get delivered ──
 
 def _load_watch():
@@ -472,36 +729,7 @@ class SnoraClient(discord.Client):
             return await ack.edit(
                 content=f"🚫 {reason}." if hard else
                         f"🚫 {reason}. Give me a clean idea and I'll blow you away with it.")
-        imgs = []
-        skipped = []
-        for a in attachments:
-            ct, fn = a.content_type or "", (a.filename or "photo")
-            if ct not in ("image/png", "image/jpeg", "image/webp", "image/heic") \
-                    or a.size > 10_000_000:
-                if ct.startswith("image/"):
-                    skipped.append(fn)
-                continue
-            raw = await a.read()
-            if ct == "image/heic":
-                # iPhone photos — the farm only eats png/jpg/webp, convert here
-                try:
-                    import io
-
-                    from PIL import Image
-                    import pillow_heif
-                    pillow_heif.register_heif_opener()
-                    im = Image.open(io.BytesIO(raw)).convert("RGB")
-                    im.thumbnail((1536, 1536))
-                    buf = io.BytesIO()
-                    im.save(buf, "JPEG", quality=88)
-                    raw = buf.getvalue()
-                except Exception:
-                    skipped.append(fn)
-                    continue
-                ext = "jpg"
-            else:
-                ext = ct.split("/")[-1].replace("jpeg", "jpg")
-            imgs.append(f"data:image/{ext};base64," + base64.b64encode(raw).decode())
+        imgs, skipped = await collect_images(attachments)
         # audio attachments: the character's voice reference (first one wins)
         voice = None
         for a in attachments:
@@ -550,7 +778,7 @@ class SnoraClient(discord.Client):
         if voice and not imgs and not plan.get("image"):
             return await ack.edit(
                 content="🎙️ A voice needs a face to ride on — send a photo with it, or name "
-                        "a library reference by name so I know who's talking.")
+                        "a reference (\"baby snail\", \"the shack\") so I know who's talking.")
         # begin→end: an explicit ending picture (slash /video ending=), or the
         # mention-flow keyword rule: attach 2+ photos and say "ending frame"
         # (or "last photo is the ending" / "ends with the last photo") and the
@@ -597,6 +825,95 @@ class SnoraClient(discord.Client):
         await self.safe_edit(ack, f"🎬 **Your shot:** {plan['prompt'][:300]}\n{plan['reply']}\n{qline}{note}")
         # 3. watch it, then deliver
         asyncio.create_task(self.watch_job(job["id"], plan, ch, ack, user, w))
+
+    # ---- the still lane (Qwen-Image-2.1) ----
+
+    async def handle_still(self, ch, user, text, ack, attachments=()):
+        blocked = nanny_check(text, getattr(getattr(ch, "guild", None), "id", None),
+                              getattr(user, "id", None))
+        if blocked:
+            reason, hard = blocked
+            log.warning("NANNY blocked still ask from %s in #%s: %s",
+                        user, getattr(ch, "name", "?"), text[:300])
+            return await ack.edit(
+                content=f"🚫 {reason}." if hard else
+                        f"🚫 {reason}. Give me a clean idea and I'll make you something great.")
+        imgs, skipped = await collect_images(attachments)
+        try:
+            plan = await asyncio.to_thread(craft_still, text, bool(imgs),
+                                            getattr(getattr(ch, "guild", None), "id", None),
+                                            getattr(user, "id", None))
+        except Exception as e:
+            log.exception("craft_still failed")
+            return await ack.edit(content=f"⚠️ Couldn't reach the picture writer "
+                                          f"({e.__class__.__name__}). Try again in a sec.")
+        if plan.get("reject"):
+            return await ack.edit(content=f"🚫 {plan['reject']}")
+
+        payload = {
+            "prompt": plan["prompt"],
+            "quality": plan["quality"],
+            "transparent": plan["transparent"],
+            "steps": 40,
+            "seed": -1,
+            "use_kv_cache": True,
+        }
+        if imgs:
+            payload["images"] = imgs[:10]
+            w, h = _qwen_size_for(imgs[0])
+            payload["width"], payload["height"] = w, h
+            size_line = f"{w}×{h}"
+        else:
+            payload["aspect"] = plan["aspect"]
+            size_line = plan["aspect"]
+
+        self.active[user.id] = self.active.get(user.id, 0) + 1
+        note = ("\n⚠️ skipped unsupported picture(s): " + ", ".join(skipped[:3])) if skipped else ""
+        kind = "🎨 **Editing your picture**" if imgs else "🎨 **Painting**"
+        await self.safe_edit(
+            ack,
+            f"{kind} — {plan['prompt'][:280]}\n{plan['reply']}\n"
+            f"_({size_line} · {plan['quality']} · {'RGBA' if plan['transparent'] else 'RGB'})_"
+            f"{note}")
+        asyncio.create_task(self.render_still(ch, ack, user, plan, payload))
+
+    async def render_still(self, ch, ack, user, plan, payload):
+        started = time.time()
+        try:
+            code, res = await asyncio.to_thread(studio_generate, payload)
+        except Exception:
+            log.exception("still submit failed")
+            code, res = 0, {"error": "unreachable"}
+        finally:
+            self.active[user.id] = max(0, self.active.get(user.id, 1) - 1)
+        if code != 200 or not res.get("ok"):
+            err = str(res.get("error") or f"HTTP {code}")[:220]
+            if "GPU busy" in err:
+                await self.safe_edit(ack, "🖥️ The Mac is mid-render on a video — I'll be free "
+                                          "in a few minutes. Try again then.")
+            else:
+                await self.safe_edit(ack, f"💥 The picture render failed: {err}")
+            return
+        jid = str(int(time.time()))
+        try:
+            path = await asyncio.to_thread(get_still, res["image"], jid)
+        except Exception:
+            path = None
+        if not path:
+            await self.safe_edit(ack, f"✅ Rendered ({plan['quality']}) but I couldn't fetch "
+                                      "the file — check the SnailStudio gallery.")
+            return
+        secs = max(1, round(time.time() - started))
+        dims = f"{res.get('width', '?')}×{res.get('height', '?')}"
+        mode = res.get("mode", "RGB")
+        await self.safe_edit(ack, f"✅ **Done in {secs}s** — {dims} · {mode} · {plan['quality']}")
+        who = f"<@{user.id}> your " if user else "Your "
+        try:
+            async with ch.typing():
+                await ch.send(f"{who}picture is ready 🐌🎨",
+                              file=discord.File(path, filename=f"snora-{jid}.png"))
+        except discord.DiscordException:
+            log.exception("still upload failed")
 
     @staticmethod
     def _render_line(job):
@@ -653,7 +970,7 @@ class SnoraClient(discord.Client):
                     break
             else:
                 await self.safe_edit(ack, "⌛ This one's been parked longer than expected — "
-                                          "ping the owner if it doesn't land.")
+                                          "ping the operator if it doesn't land.")
         finally:
             # record completion FIRST — a crash after delivery must never make
             # a restart redeliver the same clip (this actually happened)
@@ -743,12 +1060,15 @@ class SnoraClient(discord.Client):
             await message.reply("Say what you'd like to see — e.g. "
                                 "`@sNora a snail astronaut drifting past Saturn` — and I'll render it. "
                                 "Defaults: 3s, 16:9, standard quality. Attach a photo to use it "
-                                "as the shot's starting picture, or name one of the server's "
-                                "standing library references you can borrow).")
+                                "as the shot's starting picture, or ask for a `picture`, `sticker` "
+                                "or an `edit` of a photo you attach (name 'baby snail', 'the shack', "
+                                "'the tiny bearded host' etc. to borrow one of the standing references).")
             return
+        still = image_intent(text)
         if not text:
             # photo in, words none — animate the photo itself
             text = "bring this photo to life with natural, gentle cinematic motion"
+            still = False
         gap = time.time() - self.last_ask.get(message.author.id, 0)
         if _is_owner(message.author.id):
             gap = 9e9  # operator: no spam/concurrency guards, they triage the queue
@@ -757,12 +1077,18 @@ class SnoraClient(discord.Client):
                                 mention_author=False)
             return
         if self.active.get(message.author.id, 0) >= CFG["max_active_per_user"]:
-            await message.reply("You already have a clip in the pipeline — I'll post it here when it's done.",
-                                mention_author=False)
+            await message.reply("You already have a render in the pipeline — I'll post it here "
+                                "when it's done.", mention_author=False)
             return
         self.last_ask[message.author.id] = time.time()
-        ack = await message.reply("🎬 On it — writing your shot…", allowed_mentions=discord.AllowedMentions.none())
-        await self.handle_ask(ch, message.author, text, ack, imgs)
+        if still:
+            ack = await message.reply("🎨 On it — reading the picture into words…",
+                                      allowed_mentions=discord.AllowedMentions.none())
+            await self.handle_still(ch, message.author, text, ack, imgs)
+        else:
+            ack = await message.reply("🎬 On it — writing your shot…",
+                                      allowed_mentions=discord.AllowedMentions.none())
+            await self.handle_ask(ch, message.author, text, ack, imgs)
 
     # ---- slash command /video (same pipeline, no mention needed) ----
 
@@ -808,6 +1134,42 @@ class SnoraClient(discord.Client):
             ack = await interaction.original_response()
             await self.handle_ask(interaction.channel, interaction.user, idea, ack,
                                   atts, end_image)
+
+        @self.tree.command(name="image",
+                           description="Generate a still picture (or edit a photo) with Qwen-Image-2.1")
+        @discord.app_commands.describe(
+            idea="What the picture should show, or how to change the attached photo",
+            photo="Optional photo to edit / use as the reference",
+            shape="Canvas shape",
+            sticker="Transparent sticker / cut-out (RGBA)")
+        @discord.app_commands.choices(shape=[
+            discord.app_commands.Choice(name="auto (match the photo)", value="auto"),
+            discord.app_commands.Choice(name="square 1:1", value="square"),
+            discord.app_commands.Choice(name="portrait 9:16", value="portrait"),
+            discord.app_commands.Choice(name="wide 16:9", value="wide"),
+        ])
+        async def _image(interaction: discord.Interaction, idea: str,
+                         photo: discord.Attachment = None,
+                         shape: discord.app_commands.Choice[str] = None,
+                         sticker: bool = False):
+            if not self.allowed(interaction.channel):
+                await interaction.response.send_message("I don't work in this channel.", ephemeral=True)
+                return
+            if (not _is_owner(interaction.user.id)
+                    and self.active.get(interaction.user.id, 0) >= CFG["max_active_per_user"]):
+                await interaction.response.send_message("You already have a render in the pipeline.",
+                                                        ephemeral=True)
+                return
+            atts = [a for a in (photo,) if a is not None]
+            hints = []
+            if shape is not None and shape.value != "auto":
+                hints.append(f"shape: {shape.value}")
+            if sticker:
+                hints.append("transparent sticker")
+            text = idea + (f" ({'; '.join(hints)})" if hints else "")
+            await interaction.response.send_message("🎨 On it — reading the picture into words…")
+            ack = await interaction.original_response()
+            await self.handle_still(interaction.channel, interaction.user, text, ack, atts)
 
 
 async def main():

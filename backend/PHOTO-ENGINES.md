@@ -218,3 +218,22 @@ If you want full-strength rewriting locally:
 Code lives in the model repo under `prompt_rewrite/`. The enrichments return
 `{"rewritten_prompt": …, "wh_ratio": …, "ratio_follow": …}`, which maps straight
 onto the `width`/`height` (or aspect) fields of the SnailStudio endpoint.
+
+---
+
+## Discord
+
+The community bot (`backend/discord_bot.py`, running beside the render service)
+now has a **still lane** alongside the video lane:
+
+- A member message asking for a `picture`, `sticker`, `logo`, `poster`, `icon`,
+  `meme`, etc. routes to Qwen instead of the video farm (`image_intent()`);
+  asks that mention video words stay on the film lane.
+- Attaching a photo with an edit verb ("change the background to…") becomes a
+  **Qwen edit** — the photo is the reference and the canvas follows its aspect.
+- `/image idea:… [photo] [shape] [sticker]` is the slash-command form.
+- **Stickers set `transparent: true` and come back as a genuine RGBA PNG** with
+  real alpha (no checkerboard), posted in the channel as an attachment.
+- Prompts are written by the same snail-api planner using the Qwen prompting
+  contract above, then POSTed to `{studio_url}/api/editor/ai/generate-qwen`
+  (default `http://127.0.0.1:7778`) and fetched from `/generated/`.
