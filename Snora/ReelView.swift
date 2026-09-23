@@ -17,9 +17,6 @@ struct RootView: View {
             CreateView()
                 .tabItem { Label("Create", systemImage: "video.badge.plus") }
                 .tag(1)
-            PhotosView()
-                .tabItem { Label("Photos", systemImage: "photo.on.rectangle") }
-                .tag(2)
         }
         .tint(Theme.signal)
         .preferredColorScheme(.dark)
@@ -30,30 +27,35 @@ struct RootView: View {
     }
 }
 
-/// what the reel is showing: everything, only in-flight jobs, or only stills
-enum ReelFilter { case all, cooking, stills }
+/// what the reel is showing: everything, or only what's still cooking
+enum ReelFilter { case all, cooking }
 
-/// one row in the unified reel — a rendered clip or a studio still
+/// one row in the unified reel — a rendered clip, a studio still, or a still
+/// the studio is painting right now
 enum FeedItem: Identifiable {
     case clip(Job)
     case still(PhotoRecord)
+    case pending(PendingStill)
 
     var id: String {
         switch self {
-        case .clip(let j):  return "clip-\(j.id)"
-        case .still(let p): return "still-\(p.id.uuidString)"
+        case .clip(let j):    return "clip-\(j.id)"
+        case .still(let p):   return "still-\(p.id.uuidString)"
+        case .pending(let p): return "pending-\(p.id.uuidString)"
         }
     }
     var created: Double {
         switch self {
-        case .clip(let j):  return j.created ?? 0
-        case .still(let p): return p.createdAt.timeIntervalSince1970
+        case .clip(let j):    return j.created ?? 0
+        case .still(let p):   return p.createdAt.timeIntervalSince1970
+        case .pending(let p): return p.started.timeIntervalSince1970
         }
     }
     var prompt: String {
         switch self {
-        case .clip(let j):  return j.prompt
-        case .still(let p): return p.prompt
+        case .clip(let j):    return j.prompt
+        case .still(let p):   return p.prompt
+        case .pending(let p): return p.prompt
         }
     }
 }
@@ -74,16 +76,18 @@ struct ReelView: View {
     @State private var showClearQueue = false
     @State private var deleteTarget: Job?
     @State private var queueNote: String?
+    @State private var showSettings = false
 
     /// the reel shows both halves of what the assistant makes: rendered clips
     /// from the farm and stills from the studio, newest first. ALL keeps failed
     /// jobs too — they explain themselves. COOKING narrows to what's in flight.
     var feed: [FeedItem] {
+        let stills = photoStore.photos.map { FeedItem.still($0) }
+        let painting = photoStore.pending.map { FeedItem.pending($0) }
         var items: [FeedItem]
         switch filter {
-        case .all:      items = jobs.map { .clip($0) } + photoStore.photos.map { .still($0) }
-        case .cooking:  items = jobs.filter { $0.isWorking }.map { .clip($0) }
-        case .stills:   items = photoStore.photos.map { .still($0) }
+        case .all:      items = jobs.map { .clip($0) } + stills + painting
+        case .cooking:  items = jobs.filter { $0.isWorking }.map { .clip($0) } + painting
         }
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
         if !q.isEmpty { items = items.filter { $0.prompt.lowercased().contains(q) } }
@@ -100,7 +104,7 @@ struct ReelView: View {
         NavigationStack {
             ZStack {
                 SnoraBackground()
-                if jobs.isEmpty && photoStore.photos.isEmpty {
+                if jobs.isEmpty && photoStore.photos.isEmpty && photoStore.pending.isEmpty {
                     emptyState
                 } else if feed.isEmpty {
                     VStack(spacing: 10) {
@@ -154,6 +158,11 @@ struct ReelView: View {
                                     } label: { Label("delete", systemImage: "trash") }
                                         .tint(Theme.ember)
                                 }
+                        case .pending(let p):
+                            PendingStillRow(pending: p)
+                                .listRowSeparator(.hidden)
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
                         }
                     }
                     .listStyle(.plain)
@@ -166,14 +175,21 @@ struct ReelView: View {
             .toolbar {
                 // clear the queue — only offered when something is actually waiting
                 ToolbarItem(placement: .topBarLeading) {
-                    if queuedCount > 0 {
-                        Button { showClearQueue = true } label: {
-                            Text("CLEAR QUEUE")
-                                .font(.snoraTag).kerning(1.2)
+                    HStack(spacing: 8) {
+                        Button { showSettings = true } label: {
+                            Image(systemName: "gearshape")
+                                .font(.system(size: 15, weight: .semibold))
                                 .foregroundStyle(Theme.cream)
-                                .padding(.horizontal, 11).padding(.vertical, 6)
-                                .background(Capsule().fill(Theme.ember.opacity(0.85)))
-                                .overlay(Capsule().stroke(Theme.ember, lineWidth: 1))
+                        }
+                        if queuedCount > 0 {
+                            Button { showClearQueue = true } label: {
+                                Text("CLEAR QUEUE")
+                                    .font(.snoraTag).kerning(1.2)
+                                    .foregroundStyle(Theme.cream)
+                                    .padding(.horizontal, 11).padding(.vertical, 6)
+                                    .background(Capsule().fill(Theme.ember.opacity(0.85)))
+                                    .overlay(Capsule().stroke(Theme.ember, lineWidth: 1))
+                            }
                         }
                     }
                 }
@@ -184,9 +200,6 @@ struct ReelView: View {
                         }
                         Chip(title: "COOKING", selected: filter == .cooking, compact: true) {
                             withAnimation { filter = .cooking }
-                        }
-                        Chip(title: "STILLS", selected: filter == .stills, compact: true) {
-                            withAnimation { filter = .stills }
                         }
                     }
                 }
@@ -237,6 +250,7 @@ struct ReelView: View {
             }
             .sheet(item: $playing) { job in PlayerSheet(job: job, token: token) }
             .sheet(item: $selectedPhoto) { rec in PhotoDetailSheet(record: rec) }
+            .sheet(isPresented: $showSettings) { SettingsSheet() }
             .task { await load(); poller.start(token: token) }
         }
         .preferredColorScheme(.dark)
@@ -347,6 +361,37 @@ struct StillRow: View {
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.cardStroke, lineWidth: 1))
                 .contentShape(Rectangle())
                 .onTapGesture { onTap() }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .snoraCard()
+        .padding(.vertical, 4)
+    }
+}
+
+/// ── a still the studio is painting right now ────────────────────────────
+struct PendingStillRow: View {
+    let pending: PendingStill
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 8) {
+                Text(pending.prompt)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(Theme.cream.opacity(0.9))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                Spacer(minLength: 4)
+                MetaTag(text: "PAINTING")
+            }
+            HStack(spacing: 8) {
+                ProgressView().tint(Theme.signal).scaleEffect(0.8)
+                MetaTag(text: pending.engine)
+                Spacer(minLength: 0)
+                Text(relativeTime(pending.started))
+                    .font(.snoraLabel)
+                    .foregroundStyle(Theme.sand.opacity(0.85))
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)

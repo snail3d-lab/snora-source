@@ -11,13 +11,23 @@ struct PhotoRecord: Identifiable, Codable {
     let localFilename: String   // inside Documents/
 }
 
-/// the Photos tab's local persistence: Documents/studio_photos.json + image files.
+/// a still the studio is painting right now (no file yet)
+struct PendingStill: Identifiable {
+    let id = UUID()
+    var prompt: String
+    var engine: String
+    var started = Date()
+}
+
+/// the reel's local persistence: Documents/studio_photos.json + image files.
 /// The studio keeps its own copy; DELETE here is local-record-only by design.
 @MainActor
 final class PhotoStore: ObservableObject {
     static let shared = PhotoStore()
 
     @Published private(set) var photos: [PhotoRecord] = []   // newest first
+    /// stills being painted right now — they ride the reel's COOKING queue
+    @Published private(set) var pending: [PendingStill] = []
 
     private let dir: URL
     private var file: URL { dir.appendingPathComponent("studio_photos.json") }
@@ -61,6 +71,18 @@ final class PhotoStore: ObservableObject {
         try? FileManager.default.removeItem(at: localURL(r))
         cache.removeObject(forKey: r.id.uuidString as NSString)
         save()
+    }
+
+    /// mark a still as in-flight so the reel's queue shows it next to video renders
+    @discardableResult
+    func beginPending(prompt: String, engine: String) -> UUID {
+        let p = PendingStill(prompt: prompt, engine: engine)
+        pending.insert(p, at: 0)
+        return p.id
+    }
+
+    func endPending(_ id: UUID) {
+        pending.removeAll { $0.id == id }
     }
 
     /// pull-to-refresh: re-download any local file that went missing

@@ -68,22 +68,29 @@ IMAGE_INTENT_RE = re.compile(
     r"illustration|drawing|artwork|logo|poster|meme|thumbnail|icon|avatar|wallpaper)\b", re.I)
 IMAGE_VERBS_RE = re.compile(r"\b(make|create|generate|draw|paint|design|give me|show me|"
                             r"need|want|edit|change|turn|add|remove|photoshop)\b", re.I)
-VIDEO_HINT_RE = re.compile(r"\b(video|clip|film|movie|animate|animation|motion|move|moving|"
-                           r"reel|sora|h3|voice|sound|song|sing|frame)\b", re.I)
+VIDEO_HINT_RE = re.compile(
+    r"\b(video|videos|clip|clips|film|movie|animate|animated|animation|motion|move|moves|"
+    r"moving|reel|sora|h3|voice|sound|song|sing|singing|speak|speaks|talking|frame|frames|"
+    r"duration|loop)\b", re.I)
+SECONDS_RE = re.compile(r"\b\d+\s*(s|sec|secs|second|seconds)\b", re.I)
 
 
 def image_intent(text):
-    """True when the member clearly wants a still picture, not a clip.
-    Asks that mention video words stay on the film lane."""
-    text = (text or "").strip()
-    if not text or VIDEO_HINT_RE.search(text):
+    """True ONLY when the member clearly wants a still picture, not a clip.
+    Video words (or a duration) always win — the film lane is the default."""
+    t = (text or "").strip()
+    if not t or VIDEO_HINT_RE.search(t) or SECONDS_RE.search(t):
         return False
-    if IMAGE_INTENT_RE.search(text) and (
-            IMAGE_VERBS_RE.search(text)
-            or re.match(r"^\s*(a|an|the)?\s*\b(image|picture|photo|sticker|logo|poster|"
-                        r"illustration|drawing)\b", text, re.I)):
+    if re.search(r"\b(sticker|stickers)\b", t, re.I):
         return True
-    return bool(re.search(r"\b(sticker|stickers)\b", text, re.I))
+    # an explicit drawing verb with no video cue is a still
+    if re.search(r"\b(draw|paint|illustrate|sketch|depict|design)\b", t, re.I):
+        return True
+    if IMAGE_INTENT_RE.search(t) and IMAGE_VERBS_RE.search(t):
+        return True
+    return bool(re.match(r"^\s*(give me\s+|make\s+|create\s+|draw\s+)?(a|an|the)?\s*"
+                         r"\b(picture|image|photo|still|logo|poster|illustration|drawing|"
+                         r"artwork|icon|avatar|wallpaper|meme)\b", t, re.I))
 
 # ── nanny layer: cheap deterministic gate, runs before the LLM or the GPU ──
 
@@ -1081,6 +1088,8 @@ class SnoraClient(discord.Client):
                                 "when it's done.", mention_author=False)
             return
         self.last_ask[message.author.id] = time.time()
+        log.info("ask from %s in #%s still=%s: %s", message.author, getattr(ch, "name", "?"),
+                 still, text[:200])
         if still:
             ack = await message.reply("🎨 On it — reading the picture into words…",
                                       allowed_mentions=discord.AllowedMentions.none())

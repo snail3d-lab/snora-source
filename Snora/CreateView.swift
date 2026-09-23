@@ -504,7 +504,7 @@ struct CreateView: View {
                 }
             }
             if failures.isEmpty {
-                assistLine = plan.message.isEmpty ? "queued \(plan.jobs.count) — check the reel and photos"
+                assistLine = plan.message.isEmpty ? "queued \(plan.jobs.count) — check the reel"
                     : "queued \(plan.jobs.count) — \(plan.message)"
             } else {
                 assistLine = "\(queued) of \(plan.jobs.count) queued — " + failures.joined(separator: " · ")
@@ -550,8 +550,10 @@ struct CreateView: View {
         }
     }
 
-    /// photo job → studio (GPU-guarded note) → download → Photos tab
+    /// photo job → studio (GPU-guarded note) → download → the reel
     @MainActor private func runPhotoJob(_ job: AssistJob, engine: String) async throws {
+        let pend = PhotoStore.shared.beginPending(prompt: job.prompt, engine: engine)
+        defer { PhotoStore.shared.endPending(pend) }
         let asp = job.aspect ?? aspect
         if let jobs = try? await API.jobs(token: token), jobs.contains(where: \.isWorking) {
             assistLine = "farm is rendering — photo will be slow"
@@ -607,7 +609,7 @@ struct CreateView: View {
         return e.localizedDescription
     }
 
-    /// a photo tapped USE FOR VIDEO on the Photos tab — set it as reference #1
+    /// a photo tapped USE FOR VIDEO in the reel — set it as reference #1
     private func consumeBridge() {
         guard let img = bridge.pendingReference else { return }
         bridge.pendingReference = nil

@@ -221,7 +221,8 @@ struct PhotoDetailSheet: View {
 }
 
 /// ── settings: studio host + assist model, with a live TEST button ──────
-private struct SettingsSheet: View {
+/// ── settings sheet (reached from the reel's gear) ───────────────────────
+struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("studio_host") private var studioHost = StudioAPI.defaultHost
     @AppStorage("assist_model") private var assistModel = "snail-top"
