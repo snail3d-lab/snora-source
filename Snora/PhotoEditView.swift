@@ -318,9 +318,9 @@ struct PhotoEditView: View {
         note = "saved to your photos"
     }
 
-    /// hand the picture to Create as the first frame of the next clip, and switch tabs
+    /// hand the edited picture to Create as a reference, and switch tabs
     private func continueAsNextShot() {
-        bridge.pendingReference = image
+        bridge.pendingReference = result ?? image
         dismiss()
     }
 }

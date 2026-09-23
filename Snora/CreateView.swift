@@ -32,6 +32,7 @@ struct CreateView: View {
     /// the words the ear actually handed us, kept on screen so a bad plan can be
     /// traced to either the recognizer or the planner
     @State private var assistHeard = ""
+    @State private var editingPhoto: FrameImage?
 
     private let maxPhotos = 9
 
@@ -45,11 +46,8 @@ struct CreateView: View {
                         if ear.listening || ear.stopping || assistBusy || !assistLine.isEmpty {
                             assistCard
                         }
-                        lookCard
                         photoCard
-                        if !photos.isEmpty {
-                            refModeCard
-                        }
+                        lookCard
                         voiceCard
                         Button { submit() } label: {
                             HStack(spacing: 8) {
@@ -96,6 +94,9 @@ struct CreateView: View {
             .sheet(isPresented: $showPicker) { MultiPhotoPicker(limit: maxPhotos - photos.count) { photos.append(contentsOf: $0) } }
             .sheet(isPresented: $showCamera) { CameraPicker { photos.append($0) } }
             .sheet(isPresented: $showAudioPicker) { AudioFilePicker { url in useAudio(url) } }
+            .sheet(item: $editingPhoto) { target in
+                PhotoEditView(initialImage: target.image)
+            }
             .onAppear { consumeBridge() }
             .onChange(of: bridge.pendingReference != nil) { _, _ in consumeBridge() }
             .onDisappear { stopRecording(save: false); ear.cancel() }
@@ -105,10 +106,11 @@ struct CreateView: View {
 
     /// ── the idea ──────────────────────────────────────────────────────
     private var ideaCard: some View {
-        SectionCard(title: "the idea") {
+        SectionCard(title: "the idea",
+                    footnote: "say it naturally — the assistant tidies your words, then picks the right engine.") {
             ZStack(alignment: .topLeading) {
                 if prompt.isEmpty {
-                    Text("a barn at golden hour, a snail in a tiny hat…")
+                    Text("a barn at golden hour, baby snail in a tiny hat…")
                         .font(.body).foregroundStyle(Theme.sand.opacity(0.5))
                         .padding(.top, 8).padding(.leading, 5)
                         .allowsHitTesting(false)
@@ -139,10 +141,10 @@ struct CreateView: View {
         }
     }
 
-    /// ── reference photos ──────────────────────────────────────────────
+    /// ── photos: pick, mark up, and say what they mean ─────────────────
     private var photoCard: some View {
-        SectionCard(title: "reference photos  \(photos.count)/\(maxPhotos)",
-                    footnote: "first photo anchors the video; the rest are extra character/scene refs")
+        SectionCard(title: "photos  \(photos.count)/\(maxPhotos)",
+                    footnote: "tap a photo to circle and change it. first photo anchors the video; the rest are extra refs.")
         {
             if !photos.isEmpty {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 72), spacing: 8)], spacing: 10) {
@@ -161,20 +163,60 @@ struct CreateView: View {
                                 }
                                 .offset(x: 6, y: -6)
                             }
+                            .overlay(alignment: .bottomTrailing) {
+                                Image(systemName: "pencil.tip.crop.circle")
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(Theme.cream)
+                                    .padding(4)
+                                    .background(Circle().fill(Theme.card.opacity(0.85)))
+                                    .padding(4)
+                            }
+                            .contentShape(RoundedRectangle(cornerRadius: 10))
+                            .onTapGesture {
+                                promptFocused = false
+                                editingPhoto = FrameImage(image: photos[i])
+                            }
+                            .contextMenu {
+                                Button {
+                                    editingPhoto = FrameImage(image: photos[i])
+                                } label: {
+                                    Label("mark up", systemImage: "pencil.tip.crop.circle")
+                                }
+                                Button(role: .destructive) {
+                                    _ = photos.remove(at: i)
+                                } label: {
+                                    Label("remove", systemImage: "trash")
+                                }
+                            }
                     }
                 }
             }
             HStack(spacing: 10) {
                 Button { promptFocused = false; showCamera = true } label: {
-                    Label("take photo", systemImage: "camera")
+                    Label("camera", systemImage: "camera")
                 }
                 .buttonStyle(GhostButtonStyle())
                 .disabled(photos.count >= maxPhotos || !UIImagePickerController.isSourceTypeAvailable(.camera))
                 Button { promptFocused = false; showPicker = true } label: {
-                    Label("choose", systemImage: "photo.on.rectangle")
+                    Label("library", systemImage: "photo.on.rectangle")
                 }
                 .buttonStyle(GhostButtonStyle())
                 .disabled(photos.count >= maxPhotos)
+            }
+            if !photos.isEmpty {
+                VStack(spacing: 8) {
+                    OptionRow(title: "the photo is the scene",
+                              subtitle: "start in the photo's setting",
+                              selected: refMode == "scene") {
+                        withAnimation { refMode = "scene" }
+                    }
+                    OptionRow(title: "the photo is who it is",
+                              subtitle: "the photo defines the subject — scene comes from the idea",
+                              selected: refMode == "identity") {
+                        withAnimation { refMode = "identity" }
+                    }
+                }
+                .padding(.top, 4)
             }
             if photos.count >= 2 {
                 Toggle(isOn: $lastIsEnding) {
@@ -188,27 +230,7 @@ struct CreateView: View {
         }
     }
 
-    /// ── what the photo means ──────────────────────────────────────────
-    private var refModeCard: some View {
-        SectionCard(title: "photo means") {
-            VStack(spacing: 8) {
-                OptionRow(title: "the photo IS the scene",
-                          subtitle: "the video starts in the photo's setting",
-                          selected: refMode == "scene")
-                {
-                    withAnimation { refMode = "scene" }
-                }
-                OptionRow(title: "just who I am",
-                          subtitle: "the photo defines who I am — the scene comes from the idea",
-                          selected: refMode == "identity")
-                {
-                    withAnimation { refMode = "identity" }
-                }
-            }
-        }
-    }
-
-    /// ── voice ─────────────────────────────────────────────────────────
+    /// ── voice ────────────────────────────────────────────────────────
     private var voiceCard: some View {
         SectionCard(title: "voice (optional)",
                     footnote: (voiceURL != nil || isRecording)
@@ -621,43 +643,29 @@ struct CreateView: View {
     private func consumeBridge() {
         guard let img = bridge.pendingReference else { return }
         bridge.pendingReference = nil
-        if photos.isEmpty {
+        if photos.count < maxPhotos {
             photos.insert(img, at: 0)
         } else {
             photos[0] = img
         }
-        msg = "photo set as your first reference"
+        msg = "photo added as your first reference"
     }
 
     /// ── submit ────────────────────────────────────────────────────────
+    // Every typed idea goes through the assistant first: it tidies the words,
+    // picks video vs. still, and honors the form dials — same brain as the mic.
     private func submit() {
         msg = ""
         promptFocused = false
+        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
         if voiceURL != nil, photos.isEmpty {
             msg = "a voice needs a reference photo — the voice rides on someone"
             return
         }
         busy = true
         Task {
-            do {
-                let useEnding = lastIsEnding && photos.count >= 2
-                _ = try await API.submit(token: token, prompt: prompt, quality: quality,
-                                         aspect: aspect, duration: duration,
-                                         photos: useEnding ? Array(photos.dropLast()) : photos,
-                                         endingPhoto: useEnding ? photos.last : nil,
-                                         voiceURL: voiceURL, refMode: refMode)
-                msg = "submitted — we'll ping you when it's ready"
-                prompt = ""
-                lastIsEnding = false
-            } catch let e as URLError where e.localizedDescription.contains("renders in progress") || e.localizedDescription.contains("queue") {
-                msg = e.localizedDescription
-            } catch let e as SubmitError {
-                msg = "submit failed — \(e.localizedDescription)"
-            } catch let e as URLError {
-                msg = "submit failed — \(API.friendlyURLError(e))"
-            } catch {
-                msg = "submit failed — \(error.localizedDescription)"
-            }
+            await planAndQueue(transcript: text)
             busy = false
         }
     }

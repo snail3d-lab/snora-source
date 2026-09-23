@@ -48,6 +48,20 @@ enum AssistAPI {
     3s is one quick line of action or a single short sentence spoken; 5s is the normal beat.
 
     RULES:
+    0. TIDY HIS WORDS: whether he speaks or types, rewrite his idea into the tightest
+       faithful prompt — fix dictation stumbles and filler, keep every name, number
+       and wish exactly, and add NOTHING he did not ask for.
+    0b. "SNAIL" vs "BABY SNAIL" — never blur them:
+       • "baby snail" / "Baby Snail" = the ANIMATED MASCOT: a six-inch Pixar-style
+         collectible toy figure of a bearded man in a navy NY cap and gray sherpa robe.
+         Never call him a snail, shell, creature or antennae-covered thing — the
+         renderer grows antennae when it reads the word "snail". Honor a mascot
+         reference photo if one is attached.
+       • "snail" on its own, or "me" / "my photo" = the user himself: real photos of him.
+         Point at an attached photo of him (ref_mode identity) and never invent or
+         describe a face in words. If he says "snail" with no photo of himself, say so
+         in the message instead of guessing a likeness.
+       • A job with both keeps the mascot and the user distinct by reference number.
     1. CHARACTER LOYALTY: If the user names a character (Grandpa, Buddy, a robot, whoever),
        every job involving that character MUST keep the same name and description in its
        prompt. Never drop, rename, or swap a character he asked for. If a reference photo
