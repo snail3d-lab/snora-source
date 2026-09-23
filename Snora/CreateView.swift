@@ -533,8 +533,14 @@ struct CreateView: View {
                 photos: usePhotos ? photos : [],
                 voiceURL: (useVoice && !photos.isEmpty) ? voiceURL : nil,
                 refMode: job.ref_mode ?? refMode)
-        case "photo_ernie":
-            try await runPhotoJob(job, engine: "ERNIE")
+        case "photo_qwen":
+            try await runPhotoJob(job, engine: "QWEN")
+        case "qwen_edit":
+            try await runPhotoJob(job, engine: "QWEN_EDIT")
+        case "qwen_multi":
+            try await runPhotoJob(job, engine: "QWEN_MULTI")
+        case "qwen_sticker":
+            try await runPhotoJob(job, engine: "QWEN_STICKER")
         case "photo_flux":
             try await runPhotoJob(job, engine: "FLUX")
         case "img2img":
@@ -550,8 +556,30 @@ struct CreateView: View {
         if let jobs = try? await API.jobs(token: token), jobs.contains(where: \.isWorking) {
             assistLine = "farm is rendering — photo will be slow"
         }
+        let q = job.quality ?? quality
         let result: StudioGenResult
         switch engine {
+        case "QWEN":
+            result = try await StudioAPI.generateQwen(
+                prompt: job.prompt, aspect: asp, quality: q,
+                transparent: job.transparent ?? false)
+        case "QWEN_STICKER":
+            result = try await StudioAPI.generateQwen(
+                prompt: job.prompt, aspect: asp, quality: q, transparent: true)
+        case "QWEN_EDIT":
+            guard let ref = photos.first else {
+                throw StudioError(status: nil, detail: "qwen edit needs a reference photo — add one above first")
+            }
+            result = try await StudioAPI.generateQwen(
+                prompt: job.prompt, aspect: asp, quality: q,
+                transparent: job.transparent ?? false, references: [ref])
+        case "QWEN_MULTI":
+            guard photos.count >= 2 else {
+                throw StudioError(status: nil, detail: "qwen multi needs at least two reference photos")
+            }
+            result = try await StudioAPI.generateQwen(
+                prompt: job.prompt, aspect: asp, quality: q,
+                transparent: job.transparent ?? false, references: Array(photos.prefix(10)))
         case "ERNIE":
             result = try await StudioAPI.generateErnie(prompt: job.prompt, aspect: asp)
         case "IMG2IMG":
@@ -567,7 +595,7 @@ struct CreateView: View {
         assistLine = "downloading photo…"
         let img = try await StudioAPI.fetchImage(path: result.image)
         PhotoStore.shared.add(remotePath: result.image, prompt: job.prompt,
-                              engine: engine, image: img)
+                              engine: engine.replacingOccurrences(of: "_", with: " "), image: img)
     }
 
     private func jobReason(_ e: Error, kind: String) -> String {

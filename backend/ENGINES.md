@@ -1,5 +1,9 @@
 # Render engines & model weights
 
+> This file covers **video**. Making stills instead? See
+> [`PHOTO-ENGINES.md`](PHOTO-ENGINES.md) for the photo engines
+> (Qwen-Image-2.1, Flux) and how to prompt them.
+
 sNora ships wired for two render engines. Both drive the same
 MiniMax-H3 video model family; pick one.
 

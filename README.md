@@ -14,6 +14,10 @@ stdlib-only Python backend that runs the whole farm.
 - **iPhone + iPad app** — write a prompt or just talk to it, attach reference
   photos and a voice, then watch takes land in a reel with a poster wall.
   It keeps polling in the background and pings you when a clip is done.
+- **Stills, not just clips** — ask the assist for a photo and it picks the right
+  local engine: **Qwen-Image-2.1** for identity-preserving edits, multi-photo
+  composites, real transparent stickers and readable text; Flux for a plain
+  artistic shot. See `backend/PHOTO-ENGINES.md`.
 - **Apple Watch app** — the render feed on your wrist with a live progress
   bar, and a big hold-to-talk mic that sends your idea to the iPhone to
   become a job. A watch-face complication shows render percent.
@@ -37,6 +41,7 @@ stdlib-only Python backend that runs the whole farm.
 | `backend/sora_config.example.json` | config template — copy to `sora_config.json` |
 | `backend/shack_manifest.example.json` | **your world** — copy to `shack_manifest.json` and describe your character, sets, and reference photos |
 | `backend/ENGINES.md` | which render engine to install (Vpipe Manager or ComfyUI) and the exact model weights each one pulls |
+| `backend/PHOTO-ENGINES.md` | stills: the photo engines (Qwen-Image-2.1, Flux), how to install them, and the prompting rules that make edits faithful |
 | `backend/LLM-LANE.md` | the prompt-writer "sauce": the OpenAI-compatible model that formats prompts and plans shots, with recipes for a spare Mac or a DGX Spark cluster |
 
 ## What hardware it needs (read first)

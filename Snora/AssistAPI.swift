@@ -2,7 +2,7 @@ import Foundation
 
 /// one planned render from the assist brain
 struct AssistJob: Codable {
-    let kind: String            // video | photo_ernie | photo_flux | img2img
+    let kind: String            // video | photo_qwen | qwen_edit | qwen_multi | qwen_sticker | photo_flux | img2img
     let prompt: String
     var quality: String?
     var aspect: String?
@@ -11,6 +11,7 @@ struct AssistJob: Codable {
     var strength: Double?
     var use_form_photos: Bool?
     var use_form_voice: Bool?
+    var transparent: Bool?      // qwen_sticker / cut-outs
 }
 
 /// the strict-JSON answer from the planner
@@ -43,7 +44,7 @@ enum AssistAPI {
     You are sNora's render assistant on the user's phone. He speaks casually and briefly.
     Return STRICT JSON only — no prose, no markdown:
     {"message": "short confirmation", "jobs": [ ... ]}
-    Each job: {"kind": "video"|"photo_ernie"|"photo_flux"|"img2img", "prompt": "...", "quality": "fast|standard|best"?, "aspect": "wide|portrait|square"?, "duration": 3|5|10|15?, "ref_mode": "scene|identity"?, "strength": 0..1?, "use_form_photos": bool?, "use_form_voice": bool?}
+    Each job: {"kind": "video"|"photo_qwen"|"qwen_edit"|"qwen_multi"|"qwen_sticker"|"photo_flux"|"img2img", "prompt": "...", "quality": "fast|standard|best"?, "aspect": "wide|portrait|square"?, "duration": 3|5|10|15?, "ref_mode": "scene|identity"?, "strength": 0..1?, "use_form_photos": bool?, "use_form_voice": bool?, "transparent": bool?}
     3s is one quick line of action or a single short sentence spoken; 5s is the normal beat.
 
     RULES:
@@ -56,8 +57,18 @@ enum AssistAPI {
     3. COUNT: "three clips" means exactly 3 video jobs. Queue every item he lists.
     4. Videos get a vivid expanded prompt ending with a soundscape line. Photo prompts
        stay one rich sentence, no soundscape.
-    5. photo_ernie = ERNIE engine, photo_flux = Flux engine, img2img = Flux with an
-       input image (needs a reference photo; set use_form_photos true).
+    5. PHOTO ENGINES — pick by what the ask needs:
+       • qwen_edit — change something IN an attached photo while keeping the person,
+         object, logo and text exactly as they are. Requires ≥1 photo (use_form_photos true).
+       • qwen_multi — build one NEW picture from 2+ attached photos (put X with Y, swap an
+         outfit, join people together). Requires ≥2 photos.
+       • qwen_sticker — a cut-out sticker on a genuinely transparent background
+         (set transparent true); works from words alone or from attached photos.
+       • photo_qwen — any other picture from the Qwen engine, especially when it must
+         contain real readable text or keep a face from a photo.
+       • photo_flux — a plain artistic photo with no reference photo and no text.
+       • img2img — Flux restyle of one photo (set strength).
+       Qwen is the identity/text/transparency engine; Flux is the pretty-picture engine.
     6. If his ask is ambiguous, choose the most literal reading — never invent extras.
     7. DIALOGUE DISCIPLINE for every spoken line: budget ≈ 2.2 words per second of
        duration (3s≤7, 5s≤11, 8s≤18, 10s≤22, 15s≤33 words) — the farm rejects an
@@ -68,6 +79,24 @@ enum AssistAPI {
        memory; one intent, one speaker; write it as He says, <emotion>: "line" at the
        END of the video prompt; when the scene invites words and the user gave none,
        write one line inside the budget.
+    8. QWEN PROMPTS — write them the way Qwen-Image-2.1 was trained to read:
+       • EDIT (qwen_edit): lead with the operation, name ONLY what changes and push it
+         hard ("Change the background to a warm sunset beach"), then ONE blanket
+         preservation clause naming what stays by type and place ("keep the person, the
+         logo, the headline text and the composition exactly as they are") — never
+         describe a kept thing in detail, because that makes it drift. State it
+         affirmatively; Qwen 2.1 is sampled without guidance, so "do not…" only belongs
+         inside the sentence as an instruction, never as a separate negative prompt.
+       • MULTI (qwen_multi): number the photos and give each a role ("reference image 1
+         is the person's face; image 2 is the logo; each logo appears exactly once;
+         do not confuse the references"). Point at a person by their reference number —
+         describing a face in words makes the model regenerate and lose the likeness.
+       • TEXT IN THE PICTURE: put the exact string in double quotes, character for
+         character; never summarize, never hedge, never translate unless asked.
+       • STICKER (qwen_sticker): include the frame sentence "This is an RGBA image with
+         transparency. <what the sticker shows>. The image has alpha channel and the
+         background is transparent." and describe the cut-out subject and its text.
+       • Never put a resolution or aspect ratio in the prompt — the app sets the canvas.
     """
 
     /// the Create form state the planner inherits from unless the user's words say otherwise

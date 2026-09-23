@@ -34,7 +34,10 @@ struct Job: Identifiable, Codable {
     let backend: String?
     let ref_mode: String?
     let ref_count: Int?
+    let source: String?
     let error: String?
+    let has_end: Bool?
+    let progress: JobProgress?
     var url: String?
 
     var videoURL: URL? {
@@ -47,6 +50,18 @@ struct Job: Identifiable, Codable {
 
     var isWorking: Bool {
         status == "queued" || status == "rendering"
+    }
+
+    /// true when this request came in through the Discord bot (a snail peep)
+    var fromDiscord: Bool {
+        (source ?? "").hasPrefix("discord")
+    }
+
+    /// the Discord handle behind a Discord-sourced job, if present
+    var discordUser: String? {
+        guard fromDiscord, let s = source, let colon = s.firstIndex(of: ":") else { return nil }
+        let name = String(s[s.index(after: colon)...])
+        return name.isEmpty ? nil : name
     }
 
     /// the farm's own words about a failure — `error` is what the service
@@ -143,7 +158,7 @@ enum API {
         switch e.code {
         case .timedOut: return "timed out — this connection is too slow for the photos, try wi-fi"
         case .notConnectedToInternet: return "no internet connection"
-        case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed: return "can't reach the server"
+        case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed: return "can't reach the backend"
         case .networkConnectionLost: return "connection dropped mid-upload"
         default: return e.localizedDescription
         }
@@ -193,6 +208,9 @@ enum API {
         let images = photos.compactMap { API.imageDataURL($0) }
         if !images.isEmpty {
             body["images"] = images
+        }
+        if let ep = endingPhoto, let d = API.imageDataURL(ep) {
+            body["end_image"] = d
         }
         if refMode == "identity" {
             body["ref_mode"] = refMode

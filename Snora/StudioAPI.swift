@@ -92,6 +92,46 @@ enum StudioAPI {
         ], timeout: 180)
     }
 
+    /// Qwen-Image-2.1 canvases — the official 2K ratios, scaled by quality
+    /// (fast 0.5, standard 0.75, best 1.0) and snapped to /32.
+    static func qwenSize(for aspect: String, quality: String = "standard") -> (w: Int, h: Int) {
+        let base: (Int, Int)
+        switch aspect {
+        case "portrait": base = (1536, 2752)   // 9:16
+        case "square":   base = (2048, 2048)   // 1:1
+        default:         base = (2752, 1536)   // 16:9
+        }
+        let scale: Double = quality == "fast" ? 0.5 : (quality == "best" ? 1.0 : 0.75)
+        func snap(_ v: Int) -> Int { max(512, Int((Double(v) * scale / 32).rounded()) * 32) }
+        return (snap(base.0), snap(base.1))
+    }
+
+    /// Qwen-Image-2.1: text→image, image editing, and multi-reference creation
+    /// (up to 10 photos), plus native transparent RGBA. Minutes per image at 2K,
+    /// so the timeout is generous.
+    static func generateQwen(prompt: String, aspect: String = "square",
+                             quality: String = "standard", steps: Int = 40, seed: Int = -1,
+                             transparent: Bool = false,
+                             references: [UIImage] = []) async throws -> StudioGenResult
+    {
+        let s = qwenSize(for: aspect, quality: quality)
+        var body: [String: Any] = [
+            "prompt": prompt, "width": s.w, "height": s.h,
+            "steps": steps, "seed": seed, "transparent": transparent,
+        ]
+        if !references.isEmpty {
+            var urls: [String] = []
+            for img in references.prefix(10) {
+                guard let png = img.pngData() else {
+                    throw StudioError(status: nil, detail: "couldn't encode a reference photo")
+                }
+                urls.append("data:image/png;base64," + png.base64EncodedString())
+            }
+            body["images"] = urls
+        }
+        return try await post("generate-qwen", body: body, timeout: 900)
+    }
+
     /// GET {host}/generated/<name> → UIImage (the studio serves these as static files)
     static func fetchImage(path: String) async throws -> UIImage {
         var p = path
