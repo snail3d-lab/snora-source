@@ -546,13 +546,15 @@ struct CreateView: View {
         case "video":
             let usePhotos = job.use_form_photos ?? true
             let useVoice = job.use_form_voice ?? true
+            let useEnding = usePhotos && lastIsEnding && photos.count >= 2
             _ = try await API.submit(
                 token: token,
                 prompt: job.prompt,
                 quality: job.quality ?? quality,
                 aspect: job.aspect ?? aspect,
                 duration: job.duration.map(Int.init) ?? duration,
-                photos: usePhotos ? photos : [],
+                photos: useEnding ? Array(photos.dropLast()) : (usePhotos ? photos : []),
+                endingPhoto: useEnding ? photos.last : nil,
                 voiceURL: (useVoice && !photos.isEmpty) ? voiceURL : nil,
                 refMode: job.ref_mode ?? refMode)
         case "photo_qwen":
