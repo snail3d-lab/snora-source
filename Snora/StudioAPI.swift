@@ -170,6 +170,7 @@ enum StudioAPI {
         } else {
             let fmt = UIGraphicsImageRendererFormat.default()
             fmt.opaque = true
+            fmt.scale = image.scale   // keep pixel dimensions identical, no 3x blow-up
             let flat = UIGraphicsImageRenderer(size: image.size, format: fmt).image { ctx in
                 UIColor.white.setFill()
                 ctx.fill(CGRect(origin: .zero, size: image.size))
