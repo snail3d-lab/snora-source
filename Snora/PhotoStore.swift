@@ -96,6 +96,27 @@ final class PhotoStore: ObservableObject {
         return fetched
     }
 
+    /// pull in anything the studio rendered that this phone doesn't have yet —
+    /// pictures made in the web editor, by an agent, or from Discord. This is
+    /// the missing half of the sync: the studio was already the source of truth
+    /// (GET /api/editor/generated) but nothing ever asked it.
+    /// Jambo promo stills are removed from the studio the moment they land in
+    /// their own cloud bucket, so they never appear in this reel.
+    @discardableResult
+    func syncFromStudio() async -> Int {
+        guard let items = try? await StudioAPI.generatedIndex() else { return 0 }
+        let known = Set(photos.map { $0.remotePath })
+        var added = 0
+        for it in items.sorted(by: { $0.created > $1.created }) where !known.contains(it.file) {
+            guard let img = try? await StudioAPI.fetchImage(path: it.file) else { continue }
+            let eng = it.engine.isEmpty ? "STUDIO" : it.engine.uppercased()
+            if add(remotePath: it.file, prompt: it.prompt, engine: eng, image: img) != nil {
+                added += 1
+            }
+        }
+        return added
+    }
+
     /// local file if present, else fetch from the studio and keep a copy
     func imageWithRemoteFallback(_ r: PhotoRecord) async -> UIImage? {
         (try? await fetchAndStore(r)) ?? nil

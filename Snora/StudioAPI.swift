@@ -8,6 +8,15 @@ struct StudioGenResult: Codable {
     let height: Int?
 }
 
+/// one artifact in the studio's generated gallery (GET /api/editor/generated)
+struct StudioArtifact: Codable, Identifiable {
+    var id: String { file }
+    let file: String
+    let prompt: String
+    let engine: String
+    let created: Double
+}
+
 /// the real reason a studio call failed — surfaced in the UI, same honesty as SubmitError
 struct StudioError: LocalizedError {
     let status: Int?
@@ -178,6 +187,20 @@ enum StudioAPI {
     }
 
     /// POST {host}/api/editor/ai/<action> with JSON; errors come back typed
+    /// every artifact the studio has rendered — app, web editor, agent, Discord.
+    /// The phone merges these so a photo made anywhere shows up in the reel.
+    static func generatedIndex() async throws -> [StudioArtifact] {
+        var req = URLRequest(url: URL(string: "\(host)/api/editor/generated")!)
+        req.timeoutInterval = 20
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let h = resp as? HTTPURLResponse, (200 ..< 300).contains(h.statusCode) else {
+            throw StudioError(status: (resp as? HTTPURLResponse)?.statusCode,
+                              detail: "the studio wouldn't list what it made")
+        }
+        struct Envelope: Codable { let items: [StudioArtifact] }
+        return (try? JSONDecoder().decode(Envelope.self, from: data))?.items ?? []
+    }
+
     static func post(_ action: String, body: [String: Any], timeout: TimeInterval) async throws -> StudioGenResult {
         guard let url = URL(string: "\(host)/api/editor/ai/\(action)") else {
             throw StudioError(status: nil, detail: "bad studio host setting")

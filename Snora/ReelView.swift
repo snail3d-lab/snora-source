@@ -325,6 +325,7 @@ struct ReelView: View {
         jobs = (try? await API.jobs(token: token)) ?? jobs
         await poller.check(token: token)
         _ = await photoStore.syncMissing()
+        _ = await photoStore.syncFromStudio()
     }
 }
 
@@ -565,7 +566,7 @@ struct JobRow: View {
     }
 
     /// render clock is GPU-only; when queueing/upload made the wall clock
-    /// meaningfully longer, say so — the user times these with a stopwatch
+    /// meaningfully longer, say so — Eric times these with a stopwatch
     private func renderLabel(_ job: Job) -> String {
         guard let g = job.genSeconds else { return "" }
         var label = "RENDER \(clock(g))"
