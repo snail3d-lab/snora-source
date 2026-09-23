@@ -154,16 +154,36 @@ enum StudioAPI {
     /// Qwen-Image-2.1 edit: the annotated picture is the single reference and the
     /// canvas follows its aspect (a circle drawn on the photo, described in words).
     static func generateQwenEdit(image: UIImage, prompt: String,
-                                 steps: Int = 40, seed: Int = -1) async throws -> StudioGenResult
+                                 steps: Int = 40, seed: Int = -1, keepAlpha: Bool = false) async throws -> StudioGenResult
     {
         let s = qwenEditSize(for: image)
-        guard let png = image.pngData() else {
-            throw StudioError(status: nil, detail: "couldn't encode the picture")
+        // Qwen-Image-2.1 has a native alpha channel: hand it an RGBA reference and
+        // it regenerates its own alpha, which often comes back mostly empty, so the
+        // result flattens onto a dark UI as a grey ghost. Send an opaque JPEG for
+        // ordinary edits (flattened onto white, not black) — also ~10x smaller.
+        let payload: Data
+        if keepAlpha {
+            guard let png = image.pngData() else {
+                throw StudioError(status: nil, detail: "couldn't encode the picture")
+            }
+            payload = png
+        } else {
+            let fmt = UIGraphicsImageRendererFormat.default()
+            fmt.opaque = true
+            let flat = UIGraphicsImageRenderer(size: image.size, format: fmt).image { ctx in
+                UIColor.white.setFill()
+                ctx.fill(CGRect(origin: .zero, size: image.size))
+                image.draw(at: .zero)
+            }
+            guard let jpeg = flat.jpegData(compressionQuality: 0.92) else {
+                throw StudioError(status: nil, detail: "couldn't encode the picture")
+            }
+            payload = jpeg
         }
         return try await post("generate-qwen", body: [
             "prompt": prompt, "width": s.w, "height": s.h, "steps": steps, "seed": seed,
-            "transparent": false,
-            "images": ["data:image/png;base64," + png.base64EncodedString()],
+            "transparent": keepAlpha,
+            "images": ["data:\(keepAlpha ? "image/png" : "image/jpeg");base64," + payload.base64EncodedString()],
         ], timeout: 900)
     }
 

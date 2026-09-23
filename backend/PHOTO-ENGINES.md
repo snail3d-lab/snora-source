@@ -72,7 +72,7 @@ POST http://<mac>:7778/api/editor/ai/generate-qwen
   "transparent":  true,                      // native RGBA
   "images":       ["data:image/png;base64,…"], // 0 = t2i, 1 = edit, up to 10
   "image_paths":  ["/abs/path.png"],         // server-side refs (editor use)
-  "true_cfg_scale": 1.0, "negative_prompt": "",
+  "true_cfg_scale": 4.0, "negative_prompt": "monochrome, greyscale, …",  // edits only
   "use_kv_cache": true
 }
 ```
@@ -191,10 +191,32 @@ regardless.
 
 ### Guidance
 
-Qwen-Image-2.1 is **meant to be sampled without guidance** (`true_cfg_scale=1.0`,
-no negative prompt). If you need classifier-free guidance, pass
-`true_cfg_scale>1` together with a `negative_prompt` — otherwise leave both at
-defaults and put any "do not …" instruction inside the sentence.
+Qwen-Image-2.1's own default is un-guided (`true_cfg_scale=1.0`), and
+**text-to-image is fine that way**. On **image edits it is not**: with an edit,
+un-guided output collapses to a flat, desaturated *embossed greyscale relief* of
+the input. Verified four ways on M5 Max — cfg 1 with no negative, cfg 4 with a
+neutral negative, cfg 4 with a richly-worded instruction, and an enriched
+instruction all came back grey; the only thing that restored colour and realism
+was a negative prompt that *names the failure mode*.
+
+So `POST /api/editor/ai/generate-qwen` now defaults, **whenever reference images
+are present**, to
+
+```
+true_cfg_scale = 4.0
+negative_prompt = "monochrome, greyscale, grayscale, desaturated, embossed,
+                   relief, washed out, low contrast, flat lighting, blurry,
+                   low quality"
+```
+
+and leaves both at defaults for plain text-to-image. Callers can still override
+either field. If you pass `true_cfg_scale>1` yourself, you must also pass a
+non-empty `negative_prompt`, or guidance is skipped entirely.
+
+Also: send **opaque RGB references** for non-transparent requests. Hand the model
+an RGBA reference and it regenerates its own alpha, often mostly empty, which
+flattens onto a dark UI as a ghost. The studio converts references to RGB and
+flattens stray output alpha onto white when `transparent` is false.
 
 ### Prefix KV cache
 
