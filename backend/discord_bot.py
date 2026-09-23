@@ -886,6 +886,20 @@ class SnoraClient(discord.Client):
 
     async def render_still(self, ch, ack, user, plan, payload):
         started = time.time()
+        # one GPU, one job — wait out any running video render before grabbing it
+        waited = 0
+        while waited < 1800:
+            try:
+                snap = await asyncio.to_thread(farm_get, "/jobs")
+                live = [j for j in snap.get("jobs", []) if j.get("status") == "rendering"]
+            except Exception:
+                break
+            if not live:
+                break
+            if waited == 0:
+                await self.safe_edit(ack, "🎨 Waiting for the video render in front of me…")
+            await asyncio.sleep(10)
+            waited += 10
         try:
             code, res = await asyncio.to_thread(studio_generate, payload)
         except Exception:

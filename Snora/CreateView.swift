@@ -555,8 +555,16 @@ struct CreateView: View {
         let pend = PhotoStore.shared.beginPending(prompt: job.prompt, engine: engine)
         defer { PhotoStore.shared.endPending(pend) }
         let asp = job.aspect ?? aspect
-        if let jobs = try? await API.jobs(token: token), jobs.contains(where: \.isWorking) {
-            assistLine = "farm is rendering — photo will be slow"
+        // one GPU, one job — wait out any running video render so stills and
+        // clips flow through the same line instead of fighting for the Mac
+        var waited = 0
+        while true {
+            guard let live = try? await API.jobs(token: token),
+                  live.contains(where: { $0.isWorking }) else { break }
+            if waited == 0 { assistLine = "waiting for the video render to finish…" }
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            waited += 8
+            if waited > 1800 { break }
         }
         let q = job.quality ?? quality
         let result: StudioGenResult
