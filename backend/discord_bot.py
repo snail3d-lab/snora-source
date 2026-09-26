@@ -1292,10 +1292,7 @@ class SnoraClient(discord.Client):
         if message.author.bot or message.guild is None:
             return
         mentioned = self.user in message.mentions
-        replying_to_bot = (message.reference is not None
-                           and message.reference.cached_message is not None
-                           and message.reference.cached_message.author.id == self.user.id)
-        if not (mentioned or replying_to_bot):
+        if not mentioned:
             return
         ch = message.channel
         if not self.allowed(ch):
