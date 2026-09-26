@@ -45,6 +45,7 @@ DEFAULTS = {
     "await_approval": False,      # True = hold Discord jobs at the owner's gate
     "nanny": True,                # hard PG gate on asks before anything runs
     "nanny_off_guilds": [],       # server IDs with the PG gate OFF (private adult channels)
+    "nanny_extra_banned": [],     # extra hard-banned words/phrases (server-side, case-insensitive)
     "owner_ids": [],              # user IDs (the operator + helpers): no nanny, no spam guards
     "snora_token": "",            # R2 fallback fetch (X-Sora-Token)
     "studio_url": "http://127.0.0.1:7778",  # SnailStudio AI-engine host (Qwen stills)
@@ -107,6 +108,14 @@ PROFANITY_RE = re.compile(
     r"\b(fuck\w*|shitt?ing?|cunt\w*|bitch\w*|ass ?hole|dick ?head|piss\w*|whore|slut\w*|"
     r"fag(got)?|nigg\w+|retard\w*|tranny)\b", re.I)
 
+# Blasphemy: expletive / mocking forms only — a reverent religious subject is fine,
+# so bare 'jesus christ' or 'god' never triggers this on its own.
+BLASPHEMY_RE = re.compile(
+    r"\b(god ?damn\w*|goddamm\w*|jesus (?:fuck\w*|fucking)|for (?:god|christ)'?s sake|"
+    r"christ'?s sake|blasphem\w*|sacrileg\w*|desecrat\w*|holy (?:shit|crap)|"
+    r"(?:hail|worship|praise) (?:the )?(?:devil|satan)|taking the lord'?s name in vain)\b",
+    re.I)
+
 
 def _is_owner(user_id):
     """Operator allowlist: runs the open lane everywhere and skips bot-side guards."""
@@ -121,16 +130,24 @@ def _nanny_on(guild_id):
 
 
 def nanny_check(text, guild_id=None, user_id=None):
-    """Return (short refusal reason, hard) for clearly disallowed asks, else None."""
+    """Return (short refusal reason, hard) for clearly disallowed asks, else None.
+    Porn and blasphemy are HARD rules: no lane, no 'art' framing, no override
+    beyond the owner allowlist."""
     # hard floor under EVERY lane — illegal content has no override, no guild exemption
     if MINOR_HOT_RE.search(text):
         return ("that one is a hard no, full stop", True)
     if _is_owner(user_id) or not _nanny_on(guild_id):
         return None
+    # configurable hard-ban list (add words in sora_config.json → nanny_extra_banned)
+    for w in CFG.get("nanny_extra_banned", []):
+        if w and re.search(r"\b" + re.escape(str(w)) + r"\b", text, re.I):
+            return (f"‘{w}’ is banned here", True)
+    if BLASPHEMY_RE.search(text):
+        return ("not here — no blasphemy", True)
     if NANNY_RE.search(text):
         if MINOR_RE.search(text):
             return ("I don't mix kids and adult content", True)
-        return ("PG-13 house rules — nothing sexual gets made here", False)
+        return ("no porn or sexual content here — hard rule", True)
     if PROFANITY_RE.search(text):
         return ("PG-13 here — mild swearing survives, that doesn't", False)
     return None
