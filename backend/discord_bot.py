@@ -489,7 +489,24 @@ def still_system_for(open_lane):
     return STILL_SYSTEM[:a] + SAFETY_OPEN + STILL_SYSTEM[b:]
 
 
-def craft_still(ask, has_photo, guild_id=None, user_id=None):
+# ── image screening rides on the director turn (snail-top vision) ───────
+
+SCREEN_NOTE = ("\n[The member attached picture(s). SCREEN THEM FIRST: if any image shows "
+               "sexual content, nudity, or anything sexualising a minor, set reject_reason "
+               "and stop — do not write a prompt. Otherwise treat them as the reference.]")
+
+
+def _user_content(text, images):
+    """OpenAI-style content: a plain string, or text + image parts when photos ride along."""
+    if not images:
+        return text
+    parts = [{"type": "text", "text": text}]
+    for u in images[:4]:
+        parts.append({"type": "image_url", "image_url": {"url": u}})
+    return parts
+
+
+def craft_still(ask, has_photo, guild_id=None, user_id=None, images=None):
     """LLM turn for the still lane: raw ask -> validated Qwen plan dict (or {"error": ...})."""
     if not (CFG["llm_base"] and CFG["llm_key"]):
         return {"error": "the bot's LLM lane isn't configured"}
@@ -497,6 +514,8 @@ def craft_still(ask, has_photo, guild_id=None, user_id=None):
     if has_photo:
         user += ("\n[The member attached a picture — treat this as an EDIT (mode 'edit'); "
                  "if no shape was named, set aspect 'auto'.]")
+    if images:
+        user += SCREEN_NOTE
     lane_open = not _nanny_on(guild_id) or _is_owner(user_id)
     sys_prompt = still_system_for(lane_open)
     corrective = ("\n[NOTE: your previous attempt refused this on copyright/IP grounds. "
@@ -507,7 +526,7 @@ def craft_still(ask, has_photo, guild_id=None, user_id=None):
                     payload={"model": CFG["llm_model"], "temperature": 0.8, "max_tokens": 1200,
                              "messages": [{"role": "system", "content": sys_prompt},
                                           {"role": "user",
-                                           "content": user + (corrective if attempt_n == 2 else "")}]},
+                                           "content": _user_content(user + (corrective if attempt_n == 2 else ""), images)}]},
                     headers={"Authorization": f"Bearer {CFG['llm_key']}"}, timeout=120)
         content = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.S)
@@ -522,7 +541,7 @@ def craft_still(ask, has_photo, guild_id=None, user_id=None):
                     continue
         if not isinstance(plan, dict):
             plan = {}
-        if (plan.get("reject_reason") and lane_open and attempt_n == 1
+        if (plan.get("reject_reason") and lane_open and attempt_n == 1 and not images
                 and not MINOR_HOT_RE.search(ask) and not MINOR_RE.search(ask)):
             log.warning("craft_still refused an open-lane ask (%s) — retrying once", ask[:80])
             continue
@@ -549,7 +568,7 @@ def craft_still(ask, has_photo, guild_id=None, user_id=None):
     }
 
 
-def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None, facts=""):
+def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None, facts="", images=None):
     """LLM turn: raw member ask -> validated plan dict (or {"error": ...})."""
     if not (CFG["llm_base"] and CFG["llm_key"]):
         return {"error": "the bot's LLM lane isn't configured"}
@@ -563,6 +582,8 @@ def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None, facts=""
     if facts:
         user += ("\n[Web research — real-world facts for accuracy. Use ONLY what helps "
                  "the shot; do not invent beyond this: ]\n" + facts)
+    if images:
+        user += SCREEN_NOTE
     lane_open = not _nanny_on(guild_id) or _is_owner(user_id)
     sys_prompt = system_for(lane_open)
     corrective = ("\n[NOTE: your previous attempt refused this on copyright/IP grounds. "
@@ -573,7 +594,7 @@ def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None, facts=""
                     payload={"model": CFG["llm_model"], "temperature": 0.7, "max_tokens": 900,
                              "messages": [{"role": "system", "content": sys_prompt},
                                           {"role": "user",
-                                           "content": user + (corrective if attempt_n == 2 else "")}]},
+                                           "content": _user_content(user + (corrective if attempt_n == 2 else ""), images)}]},
                     headers={"Authorization": f"Bearer {CFG['llm_key']}"}, timeout=120)
         content = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.S)
@@ -588,7 +609,7 @@ def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None, facts=""
                     continue
         if not isinstance(plan, dict):
             plan = {}
-        if (plan.get("reject_reason") and lane_open and attempt_n == 1
+        if (plan.get("reject_reason") and lane_open and attempt_n == 1 and not images
                 and not MINOR_HOT_RE.search(ask) and not MINOR_RE.search(ask)):
             log.warning("craft refused an open-lane ask (%s) — retrying once: %s",
                         ask[:80], str(plan["reject_reason"])[:120])
@@ -906,7 +927,7 @@ class SnoraClient(discord.Client):
         try:
             plan = await asyncio.to_thread(craft, text, bool(imgs), bool(voice),
                                             getattr(getattr(ch, "guild", None), "id", None),
-                                            getattr(user, "id", None), facts)
+                                            getattr(user, "id", None), facts, list(imgs))
         except Exception as e:
             log.exception("llm failed")
             return await ack.edit(content=f"⚠️ Couldn't reach the scene writer ({e.__class__.__name__}). "
@@ -982,7 +1003,7 @@ class SnoraClient(discord.Client):
         try:
             plan = await asyncio.to_thread(craft_still, text, bool(imgs),
                                             getattr(getattr(ch, "guild", None), "id", None),
-                                            getattr(user, "id", None))
+                                            getattr(user, "id", None), list(imgs))
         except Exception as e:
             log.exception("craft_still failed")
             return await ack.edit(content=f"⚠️ Couldn't reach the picture writer "
