@@ -24,6 +24,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import discord
@@ -47,6 +48,7 @@ DEFAULTS = {
     "owner_ids": [],              # user IDs (the operator + helpers): no nanny, no spam guards
     "snora_token": "",            # R2 fallback fetch (X-Sora-Token)
     "studio_url": "http://127.0.0.1:7778",  # SnailStudio AI-engine host (Qwen stills)
+    "searx_url": "",             # your SearXNG JSON endpoint, e.g. http://127.0.0.1:8889/search
 }
 
 DURATIONS = {3, 4, 5, 8, 10, 15}
@@ -148,6 +150,7 @@ def load_cfg():
     cfg["llm_key"] = sc.get("snail_api_key", "")
     cfg["llm_model"] = sc.get("snail_model", "snail-top")
     cfg["studio_url"] = sc.get("studio_url", DEFAULTS["studio_url"])
+    cfg["searx_url"] = sc.get("searx_url", DEFAULTS["searx_url"])
     cfg.update(sc.get("discord") or {})
     return cfg
 
@@ -529,7 +532,7 @@ def craft_still(ask, has_photo, guild_id=None, user_id=None):
     }
 
 
-def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None):
+def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None, facts=""):
     """LLM turn: raw member ask -> validated plan dict (or {"error": ...})."""
     if not (CFG["llm_base"] and CFG["llm_key"]):
         return {"error": "the bot's LLM lane isn't configured"}
@@ -540,6 +543,9 @@ def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None):
         user += ("\n[The member attached an audio clip — it is the character's VOICE "
                  "REFERENCE. Write one budget-friendly spoken line for the shot; the "
                  "rendered character speaks it with that voice.]")
+    if facts:
+        user += ("\n[Web research — real-world facts for accuracy. Use ONLY what helps "
+                 "the shot; do not invent beyond this: ]\n" + facts)
     lane_open = not _nanny_on(guild_id) or _is_owner(user_id)
     sys_prompt = system_for(lane_open)
     corrective = ("\n[NOTE: your previous attempt refused this on copyright/IP grounds. "
@@ -638,6 +644,82 @@ def share_link(jid, kind="video"):
     except Exception:
         log.exception("share link failed for %s", jid)
         return None
+
+
+# ── web research (SearXNG JSON API) ─────────────────────────────────────
+
+LOOKUP_RE = re.compile(
+    r"\b(look ?up|search(?: the web| the internet| for)?|google|research|"
+    r"find out|tell me about|what(?:'s| is| are)|who(?:'s| is| are)|"
+    r"where(?:'s| is| are)|when (?:is|was|did))\b", re.I)
+CUE_RE = re.compile(
+    r"\b(real|actual|historically|historic|documentary|based on|true story|"
+    r"in the style of|looks? like the real|footage of|accurate|factual|wiki|"
+    r"look ?up|search|research|google)\b", re.I)
+RENDER_RE = re.compile(
+    r"\b(render|generate|animate|video|clip|picture|image|photo|sticker|edit|"
+    r"make (?:a |an )?(?:video|clip|picture|image|photo|sticker))\b", re.I)
+
+
+def searx_search(query, limit=6):
+    """SearXNG JSON API -> [{'title','url','snippet'}, ...].
+    Blocking — always call via asyncio.to_thread. No searx_url = feature off."""
+    if not CFG.get("searx_url"):
+        return []
+    url = CFG["searx_url"] + "?" + urllib.parse.urlencode({"q": query[:400], "format": "json"})
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA,
+                                                   "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        log.exception("searx search failed for %r", query[:80])
+        return []
+    out = []
+    for r in (data.get("results") or [])[:limit]:
+        out.append({"title": (r.get("title") or "").strip()[:160],
+                    "url": (r.get("url") or "").strip(),
+                    "snippet": (r.get("content") or "").strip()[:400]})
+    return out
+
+
+def format_facts(results):
+    """Compact fact sheet handed to the scene writer (keeps the prompt honest)."""
+    if not results:
+        return ""
+    lines = []
+    for r in results[:5]:
+        bit = f"- {r['title']}"
+        if r["snippet"]:
+            bit += f": {r['snippet']}"
+        lines.append(bit)
+    return "\n".join(lines)[:1600]
+
+
+def research_answer(query, results):
+    """LLM summary of the search results — plain prose, no render."""
+    if not (CFG["llm_base"] and CFG["llm_key"]):
+        return ""
+    sheet = format_facts(results)
+    sys_prompt = ("You are sNora, a sharp research assistant. Answer the user's question "
+                  "in 2-4 tight sentences using ONLY the web results provided. If they "
+                  "don't cover it, say so plainly. No preamble, no bullet points.")
+    _, d = _req(CFG["llm_base"] + "/chat/completions",
+                payload={"model": CFG["llm_model"], "temperature": 0.3, "max_tokens": 400,
+                         "messages": [{"role": "system", "content": sys_prompt},
+                                      {"role": "user",
+                                       "content": f"Question: {query}\n\nWeb results:\n{sheet}"}]},
+                headers={"Authorization": f"Bearer {CFG['llm_key']}"}, timeout=90)
+    return ((d.get("choices") or [{}])[0].get("message", {}).get("content") or "").strip()
+
+
+def lookup_intent(text):
+    return bool(LOOKUP_RE.search(text))
+
+
+def render_intent(text):
+    return bool(RENDER_RE.search(text) or VIDEO_HINT_RE.search(text)
+                or IMAGE_INTENT_RE.search(text))
 
 
 # ── still-image delivery (SnailStudio Qwen-Image-2.1) ────────────────────
@@ -793,11 +875,21 @@ class SnoraClient(discord.Client):
                 aext = "mpeg"
             voice = f"data:audio/{aext};base64," + base64.b64encode(raw).decode()
             break
+        # 0b. web research: only when the ask reaches for real-world facts
+        facts = ""
+        if lookup_intent(text) or CUE_RE.search(text):
+            try:
+                results = await asyncio.to_thread(searx_search, text, 5)
+                facts = format_facts(results)
+                if facts:
+                    log.info("researched %d web result(s) for: %s", len(results), text[:80])
+            except Exception:
+                log.exception("research step failed")
         # 1. LLM formats the ask into a real scene prompt
         try:
             plan = await asyncio.to_thread(craft, text, bool(imgs), bool(voice),
                                             getattr(getattr(ch, "guild", None), "id", None),
-                                            getattr(user, "id", None))
+                                            getattr(user, "id", None), facts)
         except Exception as e:
             log.exception("llm failed")
             return await ack.edit(content=f"⚠️ Couldn't reach the scene writer ({e.__class__.__name__}). "
@@ -1108,6 +1200,24 @@ class SnoraClient(discord.Client):
                 log.exception("clip link fallback failed for %s", jid)
         return False
 
+    async def handle_research(self, ch, user, text, ack):
+        """Pure web-research answer — SearXNG + LLM summary, no render."""
+        q = re.sub(r"(?i)^\s*(please\s+)?(look ?up|search(?: the web| the internet| for)?|"
+                   r"google|research|find out(?: about)?|tell me about)\s*", "", text).strip(" ?.")
+        q = q or text
+        results = await asyncio.to_thread(searx_search, q, 6)
+        if not results:
+            await self.safe_edit(ack, f"🔎 I couldn't find anything on “{q[:200]}”.")
+            return
+        answer = await asyncio.to_thread(research_answer, q, results)
+        parts = []
+        if answer:
+            parts.append(answer)
+        for r in results[:4]:
+            if r["url"]:
+                parts.append(f"• [{r['title'][:80]}]({r['url']})")
+        await self.safe_edit(ack, "\n".join(parts)[:1990])
+
     # ---- entry points ----
 
     async def on_ready(self):
@@ -1167,6 +1277,15 @@ class SnoraClient(discord.Client):
             # photo in, words none — animate the photo itself
             text = "bring this photo to life with natural, gentle cinematic motion"
             still = False
+        # pure research lane: "@sNora look up …" answers in chat, no render
+        if lookup_intent(text) and not render_intent(text):
+            self.last_ask[message.author.id] = time.time()
+            log.info("research from %s in #%s: %s", message.author,
+                     getattr(ch, "name", "?"), text[:200])
+            ack = await message.reply("🔎 Searching the web…",
+                                      allowed_mentions=discord.AllowedMentions.none())
+            await self.handle_research(ch, message.author, text, ack)
+            return
         gap = time.time() - self.last_ask.get(message.author.id, 0)
         if _is_owner(message.author.id):
             gap = 9e9  # operator: no spam/concurrency guards, they triage the queue
@@ -1234,6 +1353,18 @@ class SnoraClient(discord.Client):
             ack = await interaction.original_response()
             await self.handle_ask(interaction.channel, interaction.user, idea, ack,
                                   atts, end_image)
+
+        @self.tree.command(name="research",
+                           description="Look something up on the web (answer only, no render)")
+        @discord.app_commands.describe(query="What to look up")
+        async def _research(interaction: discord.Interaction, query: str):
+            if not self.allowed(interaction.channel):
+                await interaction.response.send_message("I don't work in this channel.",
+                                                        ephemeral=True)
+                return
+            await interaction.response.send_message("🔎 Searching the web…")
+            ack = await interaction.original_response()
+            await self.handle_research(interaction.channel, interaction.user, query, ack)
 
         @self.tree.command(name="image",
                            description="Generate a still picture (or edit a photo) with Qwen-Image-2.1")
