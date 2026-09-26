@@ -620,6 +620,26 @@ def get_clip(jid):
     return tmp if os.path.getsize(tmp) > 1000 else None
 
 
+def share_link(jid, kind="video"):
+    """Create an UNGATED public watch link for a finished clip (worker KV share).
+    Delivery fallback: keeps a render reachable when the channel refuses
+    attachments or the file beats the server's upload cap."""
+    if not CFG["snora_token"]:
+        return None
+    try:
+        req = urllib.request.Request(
+            f"{CFG['worker_base']}/api/sora/share",
+            data=json.dumps({"id": jid, "kind": kind}).encode(), method="POST",
+            headers={"Content-Type": "application/json",
+                     "X-Sora-Token": CFG["snora_token"],
+                     "User-Agent": BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode()).get("url")
+    except Exception:
+        log.exception("share link failed for %s", jid)
+        return None
+
+
 # ── still-image delivery (SnailStudio Qwen-Image-2.1) ────────────────────
 
 def studio_generate(payload):
@@ -822,8 +842,10 @@ class SnoraClient(discord.Client):
         job = res
         self.active[user.id] = self.active.get(user.id, 0) + 1
         w = _load_watch()
+        ask_mid = getattr(getattr(ack, "reference", None), "message_id", None)
         w[job["id"]] = {"channel": int(ch.id), "message": int(ack.id), "user": int(user.id),
-                        "ask": text[:200], "started": time.time(), "done_notified": False}
+                        "ask": text[:200], "started": time.time(), "done_notified": False,
+                        "ask_message": int(ask_mid) if ask_mid else 0}
         _save_watch(w)
         try:
             snapshot = (await asyncio.to_thread(farm_get, "/jobs")).get("jobs", [])
@@ -931,12 +953,19 @@ class SnoraClient(discord.Client):
         mode = res.get("mode", "RGB")
         await self.safe_edit(ack, f"✅ **Done in {secs}s** — {dims} · {mode} · {plan['quality']}")
         who = f"<@{user.id}> your " if user else "Your "
-        try:
-            async with ch.typing():
-                await ch.send(f"{who}picture is ready 🐌🎨",
-                              file=discord.File(path, filename=f"snora-{jid}.png"))
-        except discord.DiscordException:
-            log.exception("still upload failed")
+        for attempt in (1, 2):
+            try:
+                async with ch.typing():
+                    await ch.send(f"{who}picture is ready 🐌🎨",
+                                  file=discord.File(path, filename=f"snora-{jid}.png"))
+                break
+            except discord.DiscordException:
+                log.exception("still upload failed (attempt %d)", attempt)
+                if attempt == 1:
+                    await asyncio.sleep(3)
+        else:
+            await self.safe_edit(ack, f"✅ Picture rendered ({secs}s) but I couldn't post it "
+                                      "here — check the SnailStudio gallery.")
 
     @staticmethod
     def _render_line(job):
@@ -956,8 +985,21 @@ class SnoraClient(discord.Client):
         return (f"🎬 **Rendering** {bar} **{pct}%** — {str(p.get('stage', ''))[:40]}{eta_txt}"
                 f"\n_({job.get('duration')}s · {job.get('aspect')} · {job.get('quality')})_")
 
+    @staticmethod
+    def _with_ask(line, ask):
+        """Keep the member's request pinned under the live status line — each
+        edit overwrites the whole message, so the ask would otherwise vanish."""
+        ask = (ask or "").strip()
+        if not ask:
+            return line
+        if len(ask) > 400:
+            ask = ask[:397] + "…"
+        return f"{line}\n\n> Asked: {ask}"
+
     async def watch_job(self, jid, plan, ch, ack, user, w):
         started = w[jid]["started"]
+        ask = w[jid].get("ask") or plan.get("prompt", "")
+        reply_to = w[jid].get("ask_message") or None
         terminal = False   # became done/failed/removed — only THEN mark handled
         try:
             while time.time() - started < CFG["max_wait_secs"]:
@@ -970,7 +1012,8 @@ class SnoraClient(discord.Client):
                     continue  # farm unreachable or a status line choked — keep waiting
                 if job is None:
                     terminal = True
-                    await self.safe_edit(ack, "🗑️ Your job was removed from the queue.")
+                    await self.safe_edit(ack, self._with_ask(
+                        "🗑️ Your job was removed from the queue.", ask))
                     break
                 st = job.get("status")
                 if st == "queued":
@@ -980,20 +1023,22 @@ class SnoraClient(discord.Client):
                     except Exception:
                         log.exception("watch %s: queue line failed", jid)
                         line = "⏳ Still in the queue — I'll edit this when my turn is up."
-                    await self.safe_edit(ack, line)
+                    await self.safe_edit(ack, self._with_ask(line, ask))
                 elif st == "rendering":
-                    await self.safe_edit(ack, self._render_line(job))
+                    await self.safe_edit(ack, self._with_ask(self._render_line(job), ask))
                 elif st == "done":
                     terminal = True
-                    await self.deliver(jid, plan, ch, ack, user, started)
+                    await self.deliver(jid, plan, ch, ack, user, started, ask, reply_to)
                     break
                 elif st == "failed":
                     terminal = True
-                    await self.safe_edit(ack, f"💥 The render failed: {str(job.get('error', 'unknown'))[:200]}")
+                    await self.safe_edit(ack, self._with_ask(
+                        f"💥 The render failed: {str(job.get('error', 'unknown'))[:200]}", ask))
                     break
             else:
-                await self.safe_edit(ack, "⌛ This one's been parked longer than expected — "
-                                          "ping the operator if it doesn't land.")
+                await self.safe_edit(ack, self._with_ask(
+                    "⌛ This one's been parked longer than expected — ping the operator if it doesn't land.",
+                    ask))
         finally:
             # record completion FIRST — a crash after delivery must never make
             # a restart redeliver the same clip (this actually happened)
@@ -1007,31 +1052,61 @@ class SnoraClient(discord.Client):
             if user is not None:
                 self.active[user.id] = max(0, self.active.get(user.id, 1) - 1)
 
-    async def deliver(self, jid, plan, ch, ack, user, started):
+    async def deliver(self, jid, plan, ch, ack, user, started, ask=None, reply_to=None):
         mins = max(1, round((time.time() - started) / 60))
         try:
             path = await asyncio.to_thread(get_clip, jid)
         except Exception:
             path = None
         if not path:
-            await self.safe_edit(ack, f"✅ Your clip rendered ({mins} min) but the bot couldn't "
-                                      "fetch the file — check the sNora gallery.")
+            await self.safe_edit(ack, self._with_ask(
+                f"✅ Your clip rendered ({mins} min) but the bot couldn't fetch the file — "
+                "check the sNora gallery.", ask))
             return
-        limit = getattr(getattr(ch, "guild", None), "filesize_limit", 10 * 1024 * 1024)
-        if os.path.getsize(path) > limit - 50_000:
-            await self.safe_edit(ack, f"✅ Your clip rendered ({mins} min) but is bigger than this "
-                                      "server's upload cap — check the sNora gallery.")
-            return
-        await self.safe_edit(ack, f"✅ **Done in {mins} min** — {plan['duration']}s · "
-                                  f"{plan['aspect']} · {plan['quality']}")
+        await self.safe_edit(ack, self._with_ask(
+            f"✅ **Done in {mins} min** — {plan['duration']}s · {plan['aspect']} · "
+            f"{plan['quality']}", ask))
         who = f"<@{user.id}> your " if user else "Your "
-        try:
-            async with ch.typing():
-                await ch.send(f"{who}sNora clip is ready 🐌🎬",
-                              file=discord.File(path, filename=f"{jid}.mp4"))
-        except discord.DiscordException:
-            # channel upload may be blocked — DM-style fallback: edit is already done
-            log.exception("deliver upload failed for %s", jid)
+        text = self._with_ask(f"{who}sNora clip is ready 🐌🎬", ask)
+        if not await self._post_clip(ch, jid, text, path, reply_to):
+            await self.safe_edit(ack, self._with_ask(
+                f"✅ Clip rendered ({mins} min) but I couldn't post it here — "
+                "check the sNora gallery.", ask))
+
+    async def _post_clip(self, ch, jid, text, path, reply_to=None):
+        """Attach the clip, retrying once; if the channel still refuses the upload
+        (or the file beats its cap), post an ungated share link so the render
+        always reaches the user. Returns True if something landed."""
+        kwargs = {}
+        if reply_to:
+            # reply to the member's own ask → guarantees they get notified, even
+            # if the server suppresses mention pings
+            try:
+                kwargs["reference"] = await ch.fetch_message(int(reply_to))
+                kwargs["mention_author"] = True
+            except discord.DiscordException:
+                log.warning("clip %s: could not fetch ask msg %s to reply", jid, reply_to)
+        limit = getattr(getattr(ch, "guild", None), "filesize_limit", 10 * 1024 * 1024)
+        attach = os.path.getsize(path) <= limit - 50_000
+        for attempt in (1, 2):
+            if not attach:
+                break
+            try:
+                async with ch.typing():
+                    await ch.send(text, file=discord.File(path, filename=f"{jid}.mp4"), **kwargs)
+                return True
+            except discord.DiscordException:
+                log.exception("clip upload failed for %s (attempt %d)", jid, attempt)
+                if attempt == 1:
+                    await asyncio.sleep(3)
+        url = await asyncio.to_thread(share_link, jid, "video")
+        if url:
+            try:
+                await ch.send(f"{text}\n{url}", **kwargs)
+                return True
+            except discord.DiscordException:
+                log.exception("clip link fallback failed for %s", jid)
+        return False
 
     # ---- entry points ----
 
