@@ -87,6 +87,12 @@ CONFIG = {
         "portrait": {"width": 480, "height": 704},
         "portrait-hd": {"width": 544, "height": 992},
         "vertical": {"width": 704, "height": 1280},   # phone-first 9:16 (the Jambo default)
+        # 9:16 that still fits a busy GPU. MEASURED 2026-10-02: 704x1280 t2v at
+        # 192 frames needs a ~2.9 GB scratch forward and the engine REFUSES with
+        # "not enough memory for a 19671-row forward ... Refusing rather than
+        # thrashing" whenever other models hold the device. True 9:16 on a smaller
+        # canvas is the same shape for a fraction of the working set.
+        "vertical-hd": {"width": 480, "height": 854},
         "wide":    {"width": 832, "height": 480},
     },
     "durations": {3: 73, 4: 90, 5: 124, 8: 192, 10: 243, 15: 362},   # seconds -> frames (17n+5)
@@ -172,9 +178,9 @@ def _enqueue_payload(data, source, ip="sched"):
     quality = (data.get("quality") or "standard").lower()
     if quality not in CONFIG["qualities"]:
         quality = "standard"
-    aspect = (data.get("aspect") or "vertical").lower()
+    aspect = (data.get("aspect") or "vertical-hd").lower()
     if aspect not in CONFIG["aspects"]:
-        aspect = "vertical"
+        aspect = "vertical-hd"
     prompt = str(data.get("prompt") or "")[:CONFIG["prompt_max_chars"]]
     with _lock:
         state = _load_state()
@@ -918,13 +924,35 @@ def _render_vpipe(job):
 
     drainer = threading.Thread(target=_drain, daemon=True)
     drainer.start()
-    try:
-        proc.wait(timeout=CONFIG["stale_secs"])
-    except subprocess.TimeoutExpired:
+    # MEASURED 2026-10-02: when vpipe decides a forward will not fit, it prints
+    #   [ERROR] ... not enough memory for a N-row forward ... Refusing rather than thrashing
+    # and then NEVER EXITS — the process sits with a frozen cputime, holding the
+    # single render slot and blocking the whole queue. Only the 90-minute stale
+    # timer ever cleared it. Watch the output for that refusal and end the render
+    # ourselves, so the job fails with the engine's own words instead of wedging
+    # the farm.
+    fatal = None
+    deadline = time.time() + CONFIG["stale_secs"]
+    while True:
+        if proc.poll() is not None:
+            break
+        if any("Refusing rather than thrashing" in l for l in lines):
+            fatal = "vpipe refused the render (not enough GPU memory)"
+            break
+        if time.time() > deadline:
+            fatal = "vpipe timed out"
+            break
+        time.sleep(1.0)
+    if fatal:
         proc.kill()
-        raise RuntimeError("vpipe timed out")
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
     drainer.join(timeout=5)
     tail = "\n".join(lines[-12:])
+    if fatal:
+        raise RuntimeError(f"{fatal}: {tail[-300:]}")
     print(f"[sora] {job['id']}: vpipe exit={proc.returncode}\n{tail}", flush=True)
     if proc.returncode != 0 or not os.path.exists(out_abs) \
             or os.path.getsize(out_abs) < 5000:
@@ -1036,6 +1064,14 @@ def _post_loop():
                         _stitch_sequence(seq.get("id"))
                     except Exception as e:
                         print(f"[sora] {jid}: stitch error: {e}", flush=True)
+                # a scheduled clip is delivered WHILE the local file still
+                # exists: the delete below removes it (the R2 copy is the source
+                # of truth for everything else, but Discord wants the bytes now)
+                if done:
+                    try:
+                        _deliver_clip({"id": jid, "clip_path": clip})
+                    except Exception as e:
+                        print(f"[sched] {jid}: delivery error: {e}", flush=True)
                 if done and not keep:
                     try:
                         os.remove(clip)
@@ -1053,13 +1089,6 @@ def _post_loop():
                     if status == "failed" and err and not state["jobs"][jid].get("error"):
                         state["jobs"][jid]["error"] = err
                     _save_state(state)
-            # a scheduled clip goes out to its channels as soon as it is on R2 —
-            # after the status flip, so a delivery crash can never re-run a render
-            if status == "done":
-                try:
-                    _deliver_clip({"id": jid, "clip_path": clip})
-                except Exception as e:
-                    print(f"[sched] {jid}: delivery error: {e}", flush=True)
             _post_wake.set()
 
 

@@ -414,7 +414,10 @@ def make_dog_job(schedule, cfg=None):
                                    ref_from_photo=bool(image_key or image_path)),
         "soundscape": dog_soundscape(song),
         "music": song["music"],
-        "aspect": schedule.get("aspect") or "vertical",   # 9:16, per Eric
+        # 9:16, per Eric — vertical-hd (480x854) is the bucket that FITS; the
+        # 704x1280 "vertical" needs a ~2.9 GB scratch forward the engine refuses
+        # when other models hold the GPU (measured 2026-10-02)
+        "aspect": schedule.get("aspect") or "vertical-hd",
         "duration": int(schedule.get("duration") or 8),
         "quality": schedule.get("quality") or "standard",
         "image_key": image_key,
