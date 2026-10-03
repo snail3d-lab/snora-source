@@ -220,6 +220,56 @@ def _req(url, payload=None, headers=None, method=None, timeout=20):
         return resp.status, json.loads(resp.read().decode())
 
 
+# ── planner token budget (MEASURED 2026-10-02) ──────────────────────────
+# snail-top's thinking lane bills its chain-of-thought to max_tokens. With the
+# whole Director's Handbook in the system prompt it thinks ~1.5-9k tokens before
+# emitting the JSON. At the old 900/1200 the reply came back finish_reason=length
+# with an EMPTY content string; craft() found no JSON and silently shipped the
+# member's raw words as the prompt — no plan, no chosen duration, so every clip
+# landed on the 3s default. 2500 fits the CoT plus the plan; the retry covers an
+# unusually long think.
+PLAN_MAX_TOKENS = 2500
+PLAN_TIMEOUT = 240
+
+
+def planner_content(messages, temperature, max_tokens=PLAN_MAX_TOKENS):
+    """One planner turn -> content. Retries ONCE at double the budget when the
+    model burned the whole allowance reasoning and returned nothing — an empty
+    plan must never degrade to the raw ask without a trace in the log."""
+    for budget in (max_tokens, max_tokens * 2):
+        _, d = _req(CFG["llm_base"] + "/chat/completions",
+                    payload={"model": CFG["llm_model"], "temperature": temperature,
+                             "max_tokens": budget, "messages": messages},
+                    headers={"Authorization": f"Bearer {CFG['llm_key']}"},
+                    timeout=PLAN_TIMEOUT)
+        ch = (d.get("choices") or [{}])[0]
+        content = (ch.get("message") or {}).get("content") or ""
+        if content.strip():
+            return content
+        log.warning("planner returned empty content (finish=%s max_tokens=%d "
+                    "completion_tokens=%s) — retrying bigger",
+                    ch.get("finish_reason"), budget,
+                    (d.get("usage") or {}).get("completion_tokens"))
+    return ""
+
+
+def explicit_duration(text):
+    """The length the member actually named, or None.
+
+    The fallback when the planner fails outright: a 3s clip for someone who
+    typed 'at least 8 seconds' is a defect, not a default.
+    """
+    nums = [int(n) for n in re.findall(r"\b(\d{1,2})\s*(?:s\b|sec|secs|second|seconds)",
+                                       text or "", re.I)]
+    nums = [n for n in nums if n in DURATIONS]
+    if nums:
+        return max(nums) if re.search(r"\bat least|\bminimum|\bor more|\bup to|\bextended\b",
+                                      text or "", re.I) else nums[0]
+    m = re.search(r"\b(three|four|five|eight|ten|fifteen)\b", text or "", re.I)
+    return ({"three": 3, "four": 4, "five": 5, "eight": 8, "ten": 10, "fifteen": 15}
+            .get(m.group(1).lower()) if m else None)
+
+
 def farm_headers(user_id=None):
     h = {"X-Sora-Secret": CFG["secret"]}
     if user_id:
@@ -311,10 +361,14 @@ SYSTEM = (
     "- Write the prompt as a complete scene: subject + action + setting + lighting + exactly "
     "ONE camera move in prose ('the camera holds steady', 'slow push in', 'pans left with her "
     "gaze'). Never keyword lists; always say what the camera does or the model invents cuts.\n"
-    "- DURATION by content: 3s is the DEFAULT — one punchy beat, quick reaction, pure "
-    "atmosphere (≤7 spoken words). Go longer only when the content truly needs it: 5s one "
-    "dialogue beat or a meaty action, 8s action+reaction or a two-beat gag, 10s two dialogue "
-    "beats or a slow reveal, 15s a full mini-scene with a turn. Allowed: 3, 4, 5, 8, 10, 15.\n"
+    "- DURATION — first, HONOUR A NAMED LENGTH: any number of seconds the member "
+    "states ('15s video', 'at least 8 seconds', 'make it 10 seconds') IS the duration; "
+    "snap it to the nearest allowed value and never overrule it down. Only when no "
+    "length is named, pick by content — 3s is the DEFAULT: one punchy beat, quick "
+    "reaction, pure atmosphere (≤7 spoken words). Go longer only when the content "
+    "truly needs it: 5s one dialogue beat or a meaty action, 8s action+reaction or a "
+    "two-beat gag, 10s two dialogue beats or a slow reveal, 15s a full mini-scene with "
+    "a turn. Allowed: 3, 4, 5, 8, 10, 15.\n"
     "- DIALOGUE is optional and scarce. If the scene invites words, write ONE short line the "
     "member didn't give you, as: He/She says, <emotion>: \"<line>\" at the END of the scene "
     "text. Budget ≈ 2.2 spoken words per second (3s → ≤7 words, 5s → ≤11 words). The farm REJECTS over-budget "
@@ -522,13 +576,11 @@ def craft_still(ask, has_photo, guild_id=None, user_id=None, images=None):
                   "That is not this studio's policy — produce the requested prompt with "
                   "reject_reason null unless it involves minors or claims about real people.]")
     for attempt_n in (1, 2):
-        _, d = _req(CFG["llm_base"] + "/chat/completions",
-                    payload={"model": CFG["llm_model"], "temperature": 0.8, "max_tokens": 1200,
-                             "messages": [{"role": "system", "content": sys_prompt},
-                                          {"role": "user",
-                                           "content": _user_content(user + (corrective if attempt_n == 2 else ""), images)}]},
-                    headers={"Authorization": f"Bearer {CFG['llm_key']}"}, timeout=120)
-        content = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        content = planner_content(
+            [{"role": "system", "content": sys_prompt},
+             {"role": "user",
+              "content": _user_content(user + (corrective if attempt_n == 2 else ""), images)}],
+            temperature=0.8)
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.S)
         m = re.search(r"\{.*\}", content, re.S)
         plan = {}
@@ -590,13 +642,11 @@ def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None, facts=""
                   "That is not this farm's policy — produce the requested prompt with "
                   "reject_reason null unless it involves minors or claims about real people.]")
     for attempt_n in (1, 2):
-        _, d = _req(CFG["llm_base"] + "/chat/completions",
-                    payload={"model": CFG["llm_model"], "temperature": 0.7, "max_tokens": 900,
-                             "messages": [{"role": "system", "content": sys_prompt},
-                                          {"role": "user",
-                                           "content": _user_content(user + (corrective if attempt_n == 2 else ""), images)}]},
-                    headers={"Authorization": f"Bearer {CFG['llm_key']}"}, timeout=120)
-        content = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        content = planner_content(
+            [{"role": "system", "content": sys_prompt},
+             {"role": "user",
+              "content": _user_content(user + (corrective if attempt_n == 2 else ""), images)}],
+            temperature=0.7)
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.S)
         m = re.search(r"\{.*\}", content, re.S)
         plan = {}
@@ -619,11 +669,20 @@ def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None, facts=""
         return {"reject": str(plan["reject_reason"])[:300], "reply": str(plan.get("reply", ""))[:300]}
     prompt = str(plan.get("prompt") or "").strip()
     if not prompt:
-        # formatter hiccup — fall back to the member's own words
+        # The planner's JSON never landed (empty content, or content the parser
+        # could not unwrap). Ship the member's own words — but NEVER silently:
+        # this used to be the reason every clip came out 3s and off-template.
         prompt = ask[:1500]
         plan.setdefault("reply", "I used your idea straight — here goes!")
+        log.warning("planner produced no usable plan for %r — falling back to the "
+                    "raw ask, duration=%s", ask[:80], explicit_duration(ask))
     duration = plan.get("duration")
-    duration = int(duration) if str(duration).isdigit() and int(duration) in DURATIONS else 3
+    if str(duration).isdigit() and int(duration) in DURATIONS:
+        duration = int(duration)
+    else:
+        # no plan (or an off-grid one) — honour a length the member named rather
+        # than defaulting to 3s
+        duration = explicit_duration(ask) or 3
     if spoken_words(prompt) > max(4, round(duration * 2.2)) and duration < 15:
         duration = 15 if duration > 8 else 10 if duration > 5 else 8  # make room for the line
     img_key = plan.get("image") if plan.get("image") in LIB_KEYS else None
@@ -742,13 +801,12 @@ def research_answer(query, results):
     sys_prompt = ("You are sNora, a sharp research assistant. Answer the user's question "
                   "in 2-4 tight sentences using ONLY the web results provided. If they "
                   "don't cover it, say so plainly. No preamble, no bullet points.")
-    _, d = _req(CFG["llm_base"] + "/chat/completions",
-                payload={"model": CFG["llm_model"], "temperature": 0.3, "max_tokens": 400,
-                         "messages": [{"role": "system", "content": sys_prompt},
-                                      {"role": "user",
-                                       "content": f"Question: {query}\n\nWeb results:\n{sheet}"}]},
-                headers={"Authorization": f"Bearer {CFG['llm_key']}"}, timeout=90)
-    return ((d.get("choices") or [{}])[0].get("message", {}).get("content") or "").strip()
+    # same thinking-lane trap as the planners: 400 tokens is all chain-of-thought,
+    # the answer comes back empty. planner_content retries bigger.
+    return planner_content(
+        [{"role": "system", "content": sys_prompt},
+         {"role": "user", "content": f"Question: {query}\n\nWeb results:\n{sheet}"}],
+        temperature=0.3, max_tokens=900).strip()
 
 
 def lookup_intent(text):

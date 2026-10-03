@@ -1930,6 +1930,35 @@ elif focus == "top":
     x = (iw - cw) // 2; y = 0
 else:
     y = (ih - ch) // 2
+    # HEAD SAFETY (measured 2026-10-02): a pure centre crop beheads a portrait
+    # whose subject sits low in the frame - the tall 9:16 and 4:5 buckets throw
+    # away the top and bottom of a landscape photo, so a head above the crop line
+    # is cut off. If a face detector finds one, shift the window just enough to
+    # keep it inside (with a small margin). No detector / no face -> unchanged.
+    try:
+        import numpy as np, cv2
+        g = np.asarray(im.convert("L"))
+        cc = cv2.CascadeClassifier(cv2.data.haarcascades +
+                                   "haarcascade_frontalface_default.xml")
+        f = cc.detectMultiScale(g, 1.1, 5, minSize=(max(24, iw // 25),) * 2)
+        if len(f):
+            fx, fy, fw, fh = max(f, key=lambda r: r[2] * r[3])
+            m = int(fh * 0.35)
+            top, bot = fy - m, fy + fh + m
+            if bot - top <= ch:
+                # the face fits: move the window the least it takes to hold it
+                if top < y:
+                    y = top
+                if bot > y + ch:
+                    y = bot - ch
+            else:
+                # taller than the canvas: centre it. Pinning the top would push
+                # the chin out; centring keeps eyes and mouth inside, which is
+                # what reads as "the whole head".
+                y = int(fy + fh / 2 - ch / 2)
+            y = max(0, min(y, ih - ch))
+    except Exception:
+        pass
 im = im.crop((x, y, x + cw, y + ch))
 im = im.resize((w, h), Image.LANCZOS)
 im.save(dst, "PNG")
