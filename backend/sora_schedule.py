@@ -350,7 +350,58 @@ def _find_dog_asset(cfg=None):
 
 # ── the prompt ──────────────────────────────────────────────────────────
 
-def build_dog_prompt(song, ref_desc=None, ref_from_photo=True, ref_mode="scene"):
+# ── the cast: every singer is a super-ripped EXOTIC American Bully ──────
+# Eric's casting call (2026-10-03): exotic bullies, "super ripped". No bully
+# photo exists in any manifest or drop-in folder, so the type has to be named
+# outright or the renderer gives a generic dog. "Exotic" carries real meaning to
+# this model: an extremely short muzzle, an oversized blocky head and a squat,
+# overbuilt frame. The look is ROTATED by song so a 2-hourly schedule does not
+# post the same animal every time.
+BULLY_LOOKS = (
+    "a heavily muscled EXOTIC American Bully — an extremely short muzzle, a huge "
+    "blocky head, tiny rose ears and a wide bow-legged stance, with the muscle "
+    "ridged and shredded under a short black coat, veins standing out across the "
+    "shoulders and thighs",
+    "a massively built exotic American Bully with a very short snout, a broad "
+    "domed skull and a deep barrel chest tapering to a tiny waist, the shredded "
+    "shoulders and forearms bulging under a blue-grey coat with a white chest",
+    "a super-ripped exotic American Bully with a stunted muzzle, an enormous "
+    "wide head and thick-set bow legs, muscle striations cut deep into its "
+    "chest, shoulders and haunches under a chocolate-and-white coat",
+    "an extreme exotic American Bully with a flat short muzzle, heavy jowls and a "
+    "massive overbuilt chest, every muscle group separated and bulging under a "
+    "tight fawn coat with a black mask",
+    "an extremely muscular exotic American Bully with a tiny muzzle, a wide "
+    "square head and a squat powerful frame, veins ridging over the shoulders "
+    "and the thighs heavily carved under a champagne coat",
+    "a wildly over-muscled exotic American Bully with a very short snout and a "
+    "huge rounded skull, its chest and shoulders shredded and deeply cut under a "
+    "merle coat with white markings",
+    "a shredded exotic American Bully with a stubby muzzle, an oversized blocky "
+    "head and a broad muscular frame, the muscle ridged and veined across its "
+    "chest and forearms under a white coat with brindle patches",
+    "a heavyweight exotic American Bully with a very short muzzle, a massive "
+    "square skull and a low heavy stance, deeply striated muscle bulging over "
+    "its shoulders and haunches under a lilac coat",
+)
+BULLY_NOTE = ("The singer is an exotic American Bully: a dog, NOT a person, with a dog's "
+              "short muzzle and dog vocal anatomy. Its build is exaggeratedly muscular "
+              "and shredded, and it never speaks words — it only sings them on the "
+              "melody.")
+
+
+def bully_look(song_id, override=None):
+    """The look for this song — stable per song, so the cast stays recognisable."""
+    if override:
+        return override
+    if not song_id:
+        return BULLY_LOOKS[0]
+    i = sum(ord(c) for c in str(song_id)) % len(BULLY_LOOKS)
+    return BULLY_LOOKS[i]
+
+
+def build_dog_prompt(song, ref_desc=None, ref_from_photo=True, ref_mode="scene",
+                     look=None):
     """A vertical singing-dog shot for one song.
 
     The dog is the subject the whole way through: it sings the line, and every
@@ -358,27 +409,28 @@ def build_dog_prompt(song, ref_desc=None, ref_from_photo=True, ref_mode="scene")
     fight. The <d>[Language] tag is what the engine actually sings in.
     """
     if ref_desc:
-        who = ("the dog from the reference photograph — "
+        who = ("the American Bully from the reference photograph — "
                + ref_desc.strip().rstrip("."))
     elif ref_from_photo:
-        who = "the dog from the reference photograph"
+        who = "the American Bully from the reference photograph"
     else:
-        # no reference image: the shot has to carry the whole animal itself, so
-        # the breed and look are named outright (a vague subject renders as mush)
-        who = ("a floppy-eared medium-sized mixed-breed dog with a red-brown coat, "
-               "a white chest and one dark eye patch")
+        # no reference image: the shot has to carry the whole animal itself
+        who = bully_look(song.get("id"), look)
     prompt = (
         f"Live-action, cinematic, a vertical medium close-up frames {who}, in "
         f"{song['setting']}. {who.capitalize()} sits up on its hind legs with its "
         f"chest out and sings with visible effort: muzzle opening wide on every "
         f"phrase, tongue and throat working, ears lifting and settling with the "
         f"melody, head tipping back slightly on the high notes, front paws keeping "
-        f"a loose rhythm. It sings the opening of \"{song['title']}\", "
+        f"a loose rhythm, jowls flapping on the loud notes while the muscle ridges "
+        f"and flexes across its chest and shoulders with every phrase. It sings the opening "
+        f"of \"{song['title']}\", "
         f"{song['country']}'s national song, in {song['lang_name']}, on the actual "
         f"melody, in a full carrying voice. Whoever is filming holds the phone at "
         f"the dog's eye level and stays put, one locked vertical frame, the dog "
         f"centred with its head and chest inside the frame the whole time. "
         f"Nobody else sings, speaks or makes any vocal sound. "
+        f"{BULLY_NOTE} "
         f"The dog sings: <d>[{song['lang_name']}] {song['lyric']}</d>"
     )
     return prompt
