@@ -17,6 +17,9 @@ struct RootView: View {
             CreateView()
                 .tabItem { Label("Create", systemImage: "video.badge.plus") }
                 .tag(1)
+            ScheduleView()
+                .tabItem { Label("Chron", systemImage: "clock.arrow.circlepath") }
+                .tag(2)
         }
         .tint(Theme.signal)
         .preferredColorScheme(.dark)
@@ -383,15 +386,33 @@ struct PendingStillRow: View {
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
                 Spacer(minLength: 4)
-                MetaTag(text: "PAINTING")
+                MetaTag(text: pending.failed == nil ? "PAINTING" : "FAILED")
             }
-            HStack(spacing: 8) {
-                ProgressView().tint(Theme.signal).scaleEffect(0.8)
-                MetaTag(text: pending.engine)
-                Spacer(minLength: 0)
-                Text(relativeTime(pending.started))
+            if let why = pending.failed {
+                // say why it died, and offer to try again from the row
+                Text(why)
                     .font(.snoraLabel)
-                    .foregroundStyle(Theme.sand.opacity(0.85))
+                    .foregroundStyle(Theme.ember)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    MetaTag(text: pending.engine)
+                    Spacer(minLength: 0)
+                    if let retry = pending.retry {
+                        Button { retry() } label: {
+                            Text("RETRY").kerning(1.4)
+                        }
+                        .buttonStyle(SignalButtonStyle())
+                    }
+                }
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView().tint(Theme.signal).scaleEffect(0.8)
+                    MetaTag(text: pending.engine)
+                    Spacer(minLength: 0)
+                    Text(relativeTime(pending.started))
+                        .font(.snoraLabel)
+                        .foregroundStyle(Theme.sand.opacity(0.85))
+                }
             }
         }
         .padding(14)

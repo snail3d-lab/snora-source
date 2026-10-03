@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""sNora render service — public video generation backend.
+"""sNora render service — public video generation for snail3d.com.
 
-Bridges a public Cloudflare worker (or any front-end) to the local render
-farm. Pure stdlib; runs under a service manager on :7789, exposed publicly
-via your tunnel of choice.
+Bridges the Cloudflare worker (public API on snail3d.com) to the local render
+farm. Pure stdlib; runs under launchd on :7789, exposed publicly via the
+cloudflared tunnel (sora.snail3d.com).
 
 Endpoints:
   GET  /health      -> {"ok": true}            (no auth — for tunnel checks)
@@ -42,6 +42,7 @@ import os
 import random
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -49,12 +50,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)          # h3_prompt.py sits beside this file
+from h3_prompt import (FIRE_RULE, CONTRACT, wants_fire, fire_slip_in,           # noqa: E402
+                       fire_corrective, soundscape_for, music_for, SOUND_SPOKEN_VOICE,
+                       negative_for, clean_body)
+import sora_schedule as SCHED                                                 # noqa: E402
 
 CONFIG = {
     "port": 7789,
     "secret": os.environ.get("SORA_SECRET", ""),
-    "worker_base": "https://your-frontend.example.com",
+    "worker_base": "https://snail3d.com",
+    "studio_url": os.environ.get("SNAILSTUDIO_URL", "http://100.120.41.45:7778"),
+    "studio_generated": os.environ.get("SNAILSTUDIO_GENERATED",
+                                         os.path.expanduser("~/SnailStudio/generated")),
     "backend": "vpipe",
+    # Qwen-Image stills take a REAL negative prompt (CFG > 1). H3 video cannot
+    # (CFG-distilled) — see h3_prompt.py. Off by default; flip fire_negative_stills.
+    "fire_negative_stills": False,
+    "fire_negative_prompt": None,
+    "fire_negative_cfg": 3.0,
     # vpipe backend
     "vpipe_bin": "/Applications/Vpipe Manager.app/Contents/Helpers/vpipe",
     "vpipe_cwd": f"{HOME}/vpipe",
@@ -71,6 +86,7 @@ CONFIG = {
         "square":  {"width": 704, "height": 704},
         "portrait": {"width": 480, "height": 704},
         "portrait-hd": {"width": 544, "height": 992},
+        "vertical": {"width": 704, "height": 1280},   # phone-first 9:16 (the Jambo default)
         "wide":    {"width": 832, "height": 480},
     },
     "durations": {3: 73, 4: 90, 5: 124, 8: 192, 10: 243, 15: 362},   # seconds -> frames (17n+5)
@@ -120,6 +136,138 @@ def _save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
+# ══ the chron lane ══════════════════════════════════════════════════════
+# Schedules produce ordinary queued jobs — same queue, same order, no priority.
+# Delivery happens in the post lane once the clip is on R2.
+
+def _enqueue_payload(data, source, ip="sched"):
+    """Create a queued job straight from a payload dict.
+
+    The scheduler's door into the shared queue. It skips the public /jobs
+    handler's per-IP throttling (a chron is the operator's own traffic) but
+    changes nothing about ORDER: the job lands at the back of the queue exactly
+    like a Discord ask, so a chron can never jump ahead of a live request.
+    """
+    image_path, key_paths, voice_path, end_image_path = None, [], None, None
+    mf = _mf(None)
+    if data.get("image"):
+        image_path = _save_dataurl(data["image"], "img")
+    if data.get("image_key"):
+        for a in mf.get("assets", []):
+            if a["key"] == data["image_key"]:
+                image_path = a["file"]
+                break
+    if not image_path and data.get("image_path"):
+        # an explicit photo the schedule chose (the drop-in dog folder)
+        cand = str(data["image_path"])
+        if os.path.isfile(cand):
+            image_path = cand
+    if data.get("voice_key"):
+        v = _mf_voice(mf)
+        if data["voice_key"] == v.get("key"):
+            voice_path = v.get("file")
+    duration = int(data.get("duration") or 5)
+    if duration not in CONFIG["durations"]:
+        duration = 5
+    quality = (data.get("quality") or "standard").lower()
+    if quality not in CONFIG["qualities"]:
+        quality = "standard"
+    aspect = (data.get("aspect") or "vertical").lower()
+    if aspect not in CONFIG["aspects"]:
+        aspect = "vertical"
+    prompt = str(data.get("prompt") or "")[:CONFIG["prompt_max_chars"]]
+    with _lock:
+        state = _load_state()
+        job_id = time.strftime("%Y%m%d") + "_" + hashlib.sha1(
+            f"{prompt}{time.time()}".encode()).hexdigest()[:8]
+        job = {
+            "id": job_id, "prompt": prompt,
+            "quality": quality, "aspect": aspect, "duration": duration,
+            "target_ratio": None, "source": str(source)[:60],
+            "lang": data.get("lang"),
+            # a sung shot: the render rewrites the scaffold's spoken clauses so
+            # the subject sings in `sing_lang` instead of speaking English
+            "sing": bool(data.get("sing")),
+            "sing_lang": str(data.get("sing_lang") or "")[:40] or None,
+            "has_image": bool(image_path), "has_voice": bool(voice_path),
+            "soundscape": str(data.get("soundscape") or "")[:600],
+            "music": str(data.get("music") or "")[:300],
+            "ref_mode": data.get("ref_mode") or "scene",
+            "zoom": float(data.get("zoom") or 1.0),
+            "focus": data.get("focus") or "center",
+            "image_path": image_path or (key_paths[0] if key_paths else None),
+            "image_paths": key_paths,
+            "end_image_path": end_image_path,
+            "voice_path": voice_path,
+            "backend": CONFIG["backend"],
+            "status": "queued",
+            "ip": ip,
+            "created": time.time(),
+            "seed": random.getrandbits(63),
+        }
+        state["jobs"][job_id] = job
+        _save_state(state)
+    print(f"[sched] queued {job_id} ({quality}/{aspect}/{duration}s) source={source}", flush=True)
+    return job_id
+
+
+def _load_schedules():
+    with _lock:
+        state = _load_state()
+    return state.setdefault("schedules", [])
+
+
+def _save_schedules(store):
+    with _lock:
+        state = _load_state()
+        state["schedules"] = store
+        _save_state(state)
+
+
+def _deliver_clip(job):
+    """Post a finished scheduled clip to its Discord channels. The app target
+    needs nothing here — the clip is already in the shared gallery."""
+    store = _load_schedules()
+    for s in store:
+        targets = s.get("targets") or []
+        if not targets or s.get("delivered"):
+            continue
+        if job["id"] not in (s.get("pending_job"), s.get("last_job_id")):
+            continue
+        label = s.get("last_song_title") or s.get("name")
+        hits, ok = [], True
+        for t in targets:
+            if t.get("kind") != "discord":
+                continue                       # app targets need no upload
+            try:
+                SCHED.post_clip(t["channel_id"], job["clip_path"],
+                                content=f"🎶 {label} — {s['name']}", cfg=CONFIG)
+                hits.append(t.get("channel_name") or t["channel_id"])
+            except Exception as e:
+                ok = False
+                print(f"[sched] {s['id']}: delivery to {t.get('channel_id')} failed: {e}",
+                      flush=True)
+        if ok:
+            s["delivered"] = True
+            s["delivered_at"] = time.time()
+            s["delivered_to"] = hits
+            print(f"[sched] {s['id']} {s['name']}: delivered {job['id']} to {hits}",
+                  flush=True)
+    _save_schedules(store)
+
+
+def _sched_loop():
+    """Tick the schedules every 30s. A schedule only ever ENQUEUES."""
+    while True:
+        try:
+            store = _load_schedules()
+            SCHED.tick({"schedules": store}, _enqueue_payload,
+                       save=_save_schedules, log=lambda m: print(m, flush=True))
+        except Exception as e:
+            print(f"[sched] tick error: {e}", flush=True)
+        time.sleep(30)
+
+
 # ── prompt scaffolding ────────────────────────────────────────────────
 
 # The H3 audio branch is text-conditioned. A bare one-liner leaves the
@@ -156,27 +304,17 @@ def word_budget(d):
 SPOKEN_CLAUSE = ("The character delivers the quoted line clearly in natural English, "
                  "one clean breath, lips moving in sync with every word; "
                  "every other moment carries only the scene's own sound.")
-SOUND_SPOKEN = ("overall_soundscape: one clear human voice speaking the quoted line with quiet "
-                "room tone between words, plus the scene's own natural ambient sound "
-                "(wind, fire, footsteps, machines)")
 
-def _scaffold(prompt):
-    music = ("subtle background music matching the mood of the scene"
-             if MUSIC_WORDS.search(prompt) else "none")
+def _scaffold(prompt, soundscape=None, music=None):
     if _has_dialogue(prompt):
-        return (f"integrated_multimodal_description: [Shot 1] {prompt} "
-                f"{SPOKEN_CLAUSE}\n"
-                f"{SOUND_SPOKEN}\n"
-                f"non_diegetic_music: {music}")
-    return (f"integrated_multimodal_description: [Shot 1] {prompt} "
-            f"Nobody speaks — the characters make no words, only natural reactions.\n"
-            f"overall_soundscape: quiet room tone with soft natural ambient sound only — no voices of any kind; "
-            f"the only audio is the scene itself (wind, fire, footsteps, machines)\n"
-            f"non_diegetic_music: {music}")
-
-
-# ── upload to worker (worker writes R2) ───────────────────────────────
-
+        body = f"{prompt} {SPOKEN_CLAUSE}"
+        sound = SOUND_SPOKEN_VOICE + soundscape_for(soundscape)
+    else:
+        body = f"{prompt} Nobody speaks — the characters make no words, only natural reactions."
+        sound = soundscape_for(soundscape)
+    return (f"integrated_multimodal_description: [Shot 1] {body}\n"
+            f"overall_soundscape: {sound}\n"
+            f"non_diegetic_music: {music_for(music)}")
 def _upload_to_worker(job_id, clip_path):
     url = f"{CONFIG['worker_base']}/api/sora/upload/{job_id}"
     data = open(clip_path, "rb").read()
@@ -189,6 +327,243 @@ def _upload_to_worker(job_id, clip_path):
     })
     with urllib.request.urlopen(req, timeout=120) as resp:
         return resp.status == 200
+
+
+def _upload_still_to_worker(still_id, data_bytes, ctype="image/png"):
+    url = f"{CONFIG['worker_base']}/api/sora/upload_still/{still_id}"
+    req = urllib.request.Request(url, data=data_bytes, method="POST", headers={
+        "X-Sora-Secret": CONFIG["secret"],
+        "Content-Type": ctype,
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+    })
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        return resp.status == 200
+
+
+def _ffmpeg_bin():
+    """launchd agents run with a thin PATH — never trust `ffmpeg` to resolve."""
+    for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"):
+        if os.path.exists(p):
+            return p
+    return "ffmpeg"
+
+
+def _forget_studio_still(ref):
+    """Jambo stills belong to the promo bucket on the website, not the studio's
+    own gallery. Once the picture is safely in R2, drop the studio copy so it
+    never shows up in the sNora app's reel (the studio prunes missing files
+    from its index automatically).
+
+    A 1280px JPEG is ~10x smaller than the raw PNG, so promos stay light."""
+    try:
+        name = os.path.basename(str(ref))
+        p = os.path.join(CONFIG["studio_generated"], name)
+        if os.path.isfile(p):
+            os.remove(p)
+    except Exception as e:
+        print(f"[jambo] could not remove the studio copy: {e}", flush=True)
+
+
+def _shrink_still(png_bytes, max_side=1280, quality=4):
+    """Photos are data-expensive to send and view. A 1280px JPEG is ~10x
+    smaller than the raw PNG and still looks right on a phone. Returns None
+    on failure so the caller keeps the PNG."""
+    tmpdir = os.path.join(CONFIG["vpipe_sandbox"], "uploads")
+    os.makedirs(tmpdir, exist_ok=True)
+    stem = os.path.join(tmpdir, f"still_{os.urandom(5).hex()}")
+    inp, outp = stem + ".png", stem + ".jpg"
+    try:
+        with open(inp, "wb") as f:
+            f.write(png_bytes)
+        expr = f"scale={max_side}:{max_side}:force_original_aspect_ratio=decrease"
+        r = subprocess.run([_ffmpeg_bin(), "-y", "-loglevel", "error", "-i", inp,
+                            "-vf", expr, "-q:v", str(quality), outp],
+                           capture_output=True, timeout=120)
+        if r.returncode != 0 or not os.path.exists(outp) or os.path.getsize(outp) < 1000:
+            return None
+        return open(outp, "rb").read()
+    except Exception:
+        return None
+    finally:
+        for p in (inp, outp):
+            try: os.remove(p)
+            except Exception: pass
+
+
+# ── still lane: SnailStudio (Qwen-Image) on this box ─────────────────
+# One GPU, one picture: the studio's Qwen worker is serial, so two "give me 2
+# variants" requests must not race each other into an OOM.
+_still_lock = threading.Lock()
+
+
+def _studio_generate(payload):
+    """POST a Qwen still job to SnailStudio. Blocking — the worker holds the call
+    for the whole render, so callers must be ready to wait."""
+    req = urllib.request.Request(
+        CONFIG["studio_url"].rstrip("/") + "/api/editor/ai/generate-qwen",
+        data=json.dumps(payload).encode(), method="POST",
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _studio_fetch(ref):
+    req = urllib.request.Request(
+        CONFIG["studio_url"].rstrip("/") + ref,
+        headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        return resp.read()
+
+
+def _builder_still_plan(message):
+    """Turn a plain-language idea into ONE Qwen image prompt (Jambo lane)."""
+    base = CONFIG.get("snail_api_base")
+    key = CONFIG.get("snail_api_key")
+    if not base or not key:
+        raise RuntimeError("snail-api key not configured")
+    msgs = [{"role": "system", "content": _jambo_still_system() + FIRE_RULE},
+            {"role": "user", "content": str(message)[:2000]}]
+    req = urllib.request.Request(
+        base + "/chat/completions",
+        data=json.dumps({"model": CONFIG.get("snail_model", "snail-top"),
+                         "messages": msgs, "max_tokens": 700, "temperature": 0.6}).encode(),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        d = json.loads(resp.read().decode())
+    content = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.S)
+    m = re.search(r"\{.*\}", content, re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return {"reply": content[:300], "prompt": str(message)[:600], "aspect": "portrait"}
+
+
+def _still_record(sid, prompt, aspect, quality, transparent, source, ip, status="rendering"):
+    return {"id": sid, "prompt": prompt, "aspect": aspect, "quality": quality,
+            "transparent": bool(transparent), "source": source, "r2": False,
+            "ext": None, "created": time.time(), "ip": ip, "status": status,
+            "seed": None, "width": None, "height": None, "mode": None, "reply": ""}
+
+
+def _still_render(sid, prompt, message, aspect, quality, transparent, images, source, ip):
+    """One Qwen still, in a background thread — the web request returns at once.
+    Stills take ~2 minutes, far longer than a Cloudflare worker proxy will wait,
+    so the page polls /stills and the cooking card shows it working."""
+    reply = ""
+    rec = {}
+    try:
+        if not prompt and message:
+            plan = _builder_still_plan(message)
+            prompt = (plan.get("prompt") or message).strip()
+            reply = plan.get("reply") or ""
+            if plan.get("aspect") in ("portrait", "square", "wide"):
+                aspect = plan["aspect"]
+            with _lock:
+                st = _load_state()
+                s = st.setdefault("stills", {}).setdefault(sid, {})
+                s.update({"prompt": prompt, "aspect": aspect, "reply": reply})
+                _save_state(st)
+        payload = {"prompt": prompt, "quality": quality,
+                   "steps": {"fast": 24, "standard": 40, "best": 60}[quality],
+                   "seed": -1, "use_kv_cache": True, "transparent": transparent,
+                   "aspect": aspect}
+        if images:
+            payload["images"] = images[:3]
+        # The video lane cannot do this (H3 is CFG-distilled); Qwen-Image can, but
+        # only with true_cfg_scale > 1. Off by default — see h3_prompt.negative_for.
+        neg, cfg = negative_for(message or prompt,
+                                enabled=bool(CONFIG.get("fire_negative_stills")),
+                                negative=CONFIG.get("fire_negative_prompt"),
+                                cfg=CONFIG.get("fire_negative_cfg") or 3.0)
+        if neg:
+            payload["negative_prompt"] = neg
+            payload["true_cfg_scale"] = cfg
+            print(f"[sora] still {sid}: CFG {cfg} with a fireless negative prompt", flush=True)
+        with _still_lock:
+            res = _studio_generate(payload)
+        ref = res.get("image") or ""
+        if not ref:
+            raise RuntimeError(res.get("error") or "the still engine returned nothing")
+        png = _studio_fetch(ref)
+        ext, blob, ctype = "png", png, "image/png"
+        if not transparent:
+            small = _shrink_still(png)
+            if small:
+                ext, blob, ctype = "jpg", small, "image/jpeg"
+        r2ok = False
+        try:
+            r2ok = _upload_still_to_worker(sid, blob, ctype)
+        except Exception as e:
+            print(f"[jambo] still upload failed: {e}", flush=True)
+        if r2ok and not transparent:
+            _forget_studio_still(ref)   # promos live in their own bucket
+        rec = {"ext": ext, "r2": r2ok, "seed": res.get("seed"),
+               "width": res.get("width"), "height": res.get("height"),
+               "mode": res.get("mode"), "status": "done",
+               "transparent": bool(transparent), "reply": reply,
+               "studio_name": os.path.basename(str(ref))}
+    except Exception as e:
+        print(f"[jambo] still {sid} failed: {e}", flush=True)
+        rec = {"status": "failed", "error": str(e)[:200]}
+    with _lock:
+        st = _load_state()
+        s = st.setdefault("stills", {}).setdefault(sid, {"id": sid, "prompt": prompt,
+                                                         "aspect": aspect,
+                                                         "quality": quality,
+                                                         "source": source,
+                                                         "created": time.time(),
+                                                         "transparent": bool(transparent)})
+        s.update(rec)
+        _save_state(st)
+
+
+def _still_create(data, ip):
+    """Queue 1-4 promotional photos. Each renders in the background and lands in R2,
+    so the HTTP call returns in milliseconds (a Cloudflare worker proxy cannot wait
+    two minutes for a render)."""
+    site = str(data.get("site") or "").strip().lower()
+    prompt = (data.get("prompt") or "").strip()
+    message = (data.get("message") or "").strip()
+    if not prompt and not message:
+        return {"error": "prompt is required"}, 400
+    if max(len(prompt), len(message)) > 2000:
+        return {"error": "keep it under 2000 characters"}, 400
+    aspect = data.get("aspect") if data.get("aspect") in ("portrait", "square", "wide") else "portrait"
+    quality = data.get("quality") if data.get("quality") in ("fast", "standard", "best") else "standard"
+    try:
+        n = int(data.get("n") or 1)
+    except Exception:
+        n = 1
+    n = min(4, max(1, n))
+    transparent = bool(data.get("transparent"))
+    images = []
+    for d in (data.get("images") or [])[:3]:
+        if isinstance(d, str) and d:
+            images.append(d)
+    if isinstance(data.get("image"), str) and data["image"]:
+        images.insert(0, data["image"])
+    source = "jambo" if site == "jambo" else None
+
+    made = []
+    for i in range(n):
+        sid = time.strftime("%Y%m%d") + "_st" + hashlib.sha1(
+            f"{prompt}{message}{time.time()}{i}".encode()).hexdigest()[:8]
+        with _lock:
+            st = _load_state()
+            st.setdefault("stills", {})[sid] = _still_record(
+                sid, prompt or message, aspect, quality, transparent, source, ip)
+            _save_state(st)
+        threading.Thread(target=_still_render,
+                         args=(sid, prompt, message, aspect, quality, transparent,
+                               images, source, ip), daemon=True).start()
+        made.append({"id": sid, "url": f"/api/sora/still/{sid}",
+                     "aspect": aspect, "status": "rendering"})
+    return {"ok": True, "stills": made, "queued": n}, 201
 
 
 def _save_dataurl(dataurl, prefix):
@@ -298,86 +673,67 @@ def _silent_wav(job):
              "-i", "anullsrc=r=32000:cl=mono", "-t", str(secs), out], check=True)
     return out
 
-def _scaffold_fl2va(prompt, dur):
+def _scaffold_fl2va(prompt, dur, soundscape=None, music=None):
     """FL2VA with first+last = same image: declare both alignment slots."""
-    music = ("subtle background music matching the mood of the scene"
-             if MUSIC_WORDS.search(prompt) else "none")
     end = f"{max(0.1, dur - 0.17):.2f}"
-    if _has_dialogue(prompt):
-        return (f"How the reference pictures align with the target video: "
-                f"Picture 1 (from Shot 1) aligns with the 0.00-second mark; "
-                f"Picture 2 (from Shot 1) aligns with the {end}-second mark.\n"
-                f"integrated_multimodal_description: [Shot 1] {prompt} "
-                f"{SPOKEN_CLAUSE}\n"
-                f"{SOUND_SPOKEN}\n"
-                f"non_diegetic_music: {music}")
-    return (f"How the reference pictures align with the target video: "
+    head = (f"How the reference pictures align with the target video: "
             f"Picture 1 (from Shot 1) aligns with the 0.00-second mark; "
-            f"Picture 2 (from Shot 1) aligns with the {end}-second mark.\n"
-            f"integrated_multimodal_description: [Shot 1] {prompt} "
-            f"Nobody speaks — the characters make no words, only natural reactions.\n"
-            f"overall_soundscape: quiet room tone with soft natural ambient sound only — no voices of any kind; "
-            f"the only audio is the scene itself (wind, fire, footsteps, machines)\n"
-            f"non_diegetic_music: {music}")
-
-
-def _scaffold_ref2va(prompt, voiceless=False):
+            f"Picture 2 (from Shot 1) aligns with the {end}-second mark.\n")
+    if _has_dialogue(prompt):
+        body = f"{prompt} {SPOKEN_CLAUSE}"
+        sound = SOUND_SPOKEN_VOICE + soundscape_for(soundscape)
+    else:
+        body = f"{prompt} Nobody speaks — the characters make no words, only natural reactions."
+        sound = soundscape_for(soundscape)
+    return (head +
+            f"integrated_multimodal_description: [Shot 1] {body}\n"
+            f"overall_soundscape: {sound}\n"
+            f"non_diegetic_music: {music_for(music)}")
+def _scaffold_ref2va(prompt, voiceless=False, soundscape=None, music=None):
     """Ref2VA: the references carry the subject/voice, prompt carries the action.
     voiceless (identity mode) renders against a SILENT wav — never claim that
     wav is the voice, the model garbles trying to clone nothing."""
-    music = ("subtle background music matching the mood of the scene"
-             if MUSIC_WORDS.search(prompt) else "none")
     if voiceless:
         # say nothing about voices when the prompt has no line — claiming a
         # voice there is what made the model babble gibberish to fill it
         if _has_dialogue(prompt):
             speech = ("The character delivers the quoted line clearly in natural English, "
                       "one clean breath, lips moving in sync with every word.\n")
-            sound = ("overall_soundscape: one clear human voice speaking the quoted line with quiet "
-                     "room tone between words, plus the scene's own natural ambient sound\n")
+            sound = "overall_soundscape: " + SOUND_SPOKEN_VOICE + soundscape_for(soundscape)
         else:
             speech = ("Nobody speaks — the characters make no words, only natural reactions. "
                       "No voice of any kind, no background chatter, no babble.\n")
-            sound = ("overall_soundscape: quiet room tone with soft natural ambient sound only — "
-                     "no voices of any kind; the only audio is the scene itself "
-                     "(wind, machines, footsteps)\n")
+            sound = "overall_soundscape: " + soundscape_for(soundscape)
         return (f"integrated_multimodal_description: [Shot 1] "
                 f"The subject shown in <Picture 1>, {prompt}\n"
-                f"{speech}{sound}"
-                f"non_diegetic_music: {music}")
+                f"{speech}{sound}\n"
+                f"non_diegetic_music: {music_for(music)}")
+    amb = " ".join(str(soundscape or "").split()) or (
+        "natural diegetic sound matching the scene and its action, clean and unprocessed")
     return (f"integrated_multimodal_description: [Shot 1] "
             f"The subject shown in <Picture 1>, speaking with the voice of <Audio 1>, {prompt}\n"
             f"Any spoken lines are in clear English.\n"
-            f"overall_soundscape: natural diegetic sound matching the scene and its action, clean and unprocessed\n"
-            f"non_diegetic_music: {music}")
-
-
-# ── vpipe backend ─────────────────────────────────────────────────────
-
+            f"overall_soundscape: {amb}\n"
+            f"non_diegetic_music: {music_for(music)}")
 def _vpipe_ready():
     return os.path.isdir(
         os.path.join(CONFIG["vpipe_cwd"], "models", *CONFIG["vpipe_model"].split("/")))
 
 
-def _scaffold_i2v(prompt):
+def _scaffold_i2v(prompt, soundscape=None, music=None):
     """i2v: one first-frame anchor (the chain/seed image), motion continues from it."""
-    music = ("subtle background music matching the mood of the scene"
-             if MUSIC_WORDS.search(prompt) else "none")
-    spoken = _has_dialogue(prompt)
-    clause = f" {SPOKEN_CLAUSE}" if spoken else (
-        " Nobody speaks — the characters make no words, only natural reactions."
-        " No voice of any kind, no background chatter, no babble.")
-    sound = ("overall_soundscape: natural diegetic sound matching the scene and its action, "
-             "clean and unprocessed" if spoken else
-             "overall_soundscape: quiet room tone with soft natural ambient sound only — "
-             "no voices of any kind; the only audio is the scene itself "
-             "(wind, fire, footsteps, machines)")
-    return (f"For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.\n"
-            f"integrated_multimodal_description: [Shot 1] {prompt}{clause}\n"
-            f"{sound}\n"
-            f"non_diegetic_music: {music}")
-
-
+    if _has_dialogue(prompt):
+        body = f"{prompt} {SPOKEN_CLAUSE}"
+        sound = SOUND_SPOKEN_VOICE + soundscape_for(soundscape)
+    else:
+        body = (f"{prompt} Nobody speaks — the characters make no words, only natural "
+                f"reactions. No voice of any kind, no background chatter, no babble.")
+        sound = soundscape_for(soundscape)
+    return (f"For the target video, at 0.00 seconds into the target video, <Picture 1> "
+            f"(from [Shot 1]) is fully referenced.\n"
+            f"integrated_multimodal_description: [Shot 1] {body}\n"
+            f"overall_soundscape: {sound}\n"
+            f"non_diegetic_music: {music_for(music)}")
 def _extract_last_frame(clip_path, out_path):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     r = subprocess.run(["ffmpeg", "-y", "-sseof", "-0.1", "-i", clip_path,
@@ -414,7 +770,7 @@ def _render_vpipe(job):
     chain_from = None
     tr = (seq or {}).get("transition", "chain") if seq else "chain"
     if job.get("ref_mode") == "identity":
-        tr = "cut"  # identity shots rebuild the user in a new scene — never chain-anchor
+        tr = "cut"  # identity shots rebuild Eric in a new scene — never chain-anchor
     if vox:
         tr = "cut"  # ref2va VO shots are standalone — no chain anchoring across partitions
     if seq and int(seq.get("index", 0)) > 0 and tr == "chain":
@@ -444,7 +800,8 @@ def _render_vpipe(job):
         except Exception as e:
             print(f"[sora] {job['id']}: end-image prep failed, using raw: {e}", flush=True)
         pipeline = CONFIG["vpipe_pipeline_be2v"]
-        prompt = _scaffold_fl2va(job["prompt"], int(job.get("duration") or 5))
+        prompt = _scaffold_fl2va(job["prompt"], int(job.get("duration") or 5),
+                                 job.get("soundscape"), job.get("music"))
         extra = [
             "--stage-cfg", f"load-image::url=[\"{img}\"]",
             "--stage-cfg", f"load-image-end::url=[\"{end_img}\"]",
@@ -456,7 +813,8 @@ def _render_vpipe(job):
         mode = "be2v(begin+end)"
     elif img and (vox or identity or multi):
         pipeline = CONFIG["vpipe_pipeline_ref2va"]
-        prompt = _scaffold_ref2va(job["prompt"], voiceless=not vox)
+        prompt = _scaffold_ref2va(job["prompt"], voiceless=not vox,
+                                  soundscape=job.get("soundscape"), music=job.get("music"))
         # The ref encoder only builds valid rows [n,96]/[n,32] when an audio ref is
         # present — EVERY voiceless ref2va (identity mode) has failed with
         # "reference rows are not [n, 96] / [n, 32]" since 2026-09-06 (11s, exit 0,
@@ -474,7 +832,7 @@ def _render_vpipe(job):
         mode = "ref2va(image" + ("+voice)" if vox else " identity-only)")
     elif chain_from is not None:
         pipeline = CONFIG["vpipe_pipeline_i2v"]
-        prompt = _scaffold_i2v(job["prompt"])
+        prompt = _scaffold_i2v(job["prompt"], job.get("soundscape"), job.get("music"))
         extra = [
             "--stage-cfg", f"load-image::url=[\"{chain_from}\"]",
             "--stage-cfg", f"first-frame::width={a['width']}",
@@ -483,7 +841,7 @@ def _render_vpipe(job):
         mode = "i2v(chain)"
     elif seq is not None and img:
         pipeline = CONFIG["vpipe_pipeline_i2v"]
-        prompt = _scaffold_i2v(job["prompt"])
+        prompt = _scaffold_i2v(job["prompt"], job.get("soundscape"), job.get("music"))
         extra = [
             "--stage-cfg", f"load-image::url=[\"{img}\"]",
             "--stage-cfg", f"first-frame::width={a['width']}",
@@ -492,7 +850,8 @@ def _render_vpipe(job):
         mode = "i2v(seed)"
     elif img:
         pipeline = CONFIG["vpipe_pipeline_fl2va"]
-        prompt = _scaffold_fl2va(job["prompt"], int(job.get("duration") or 5))
+        prompt = _scaffold_fl2va(job["prompt"], int(job.get("duration") or 5),
+                                 job.get("soundscape"), job.get("music"))
         extra = [
             "--stage-cfg", f"load-image::url=[\"{img}\"]",
             "--stage-cfg", f"first-frame::width={a['width']}",
@@ -504,11 +863,30 @@ def _render_vpipe(job):
         mode = "fl2va(image)"
     else:
         pipeline = CONFIG["vpipe_pipeline"]
-        prompt = _scaffold(job["prompt"])
+        prompt = _scaffold(job["prompt"], job.get("soundscape"), job.get("music"))
         extra = [
             "--stage-cfg", f"model-select::hf_dir={CONFIG['vpipe_model']}",
         ]
         mode = "t2v"
+
+    # Jambo lane: Swahili is spoken natively from the <d>[Swahili] tag, but every
+    # scaffold says "natural English" by default — redirect the language clause here.
+    if str(job.get("lang") or "").lower().startswith("sw"):
+        prompt = prompt.replace("natural English", "natural Swahili")
+    # Chron singing lane: every spoken scaffold says "natural English ... lips
+    # moving in sync" and would fight a dog singing a foreign anthem, so the
+    # scaffold's spoken clauses are rewritten in place (the same idiom the
+    # Swahili redirect above uses).
+    if job.get("sing"):
+        prompt = prompt.replace("delivers the quoted line", "sings the quoted line")
+        prompt = prompt.replace(
+            "natural English", str(job.get("sing_lang") or "the language in the tag"))
+        prompt = prompt.replace("lips moving in sync with every word",
+                                "mouth and throat open and working on every phrase")
+        prompt = prompt.replace("one clean breath", "one continuous take")
+        prompt = prompt.replace(
+            SOUND_SPOKEN_VOICE,
+            "one clear non-human voice singing the quoted line, plus ")
 
     cmd = [
         CONFIG["vpipe_bin"],
@@ -675,6 +1053,13 @@ def _post_loop():
                     if status == "failed" and err and not state["jobs"][jid].get("error"):
                         state["jobs"][jid]["error"] = err
                     _save_state(state)
+            # a scheduled clip goes out to its channels as soon as it is on R2 —
+            # after the status flip, so a delivery crash can never re-run a render
+            if status == "done":
+                try:
+                    _deliver_clip({"id": jid, "clip_path": clip})
+                except Exception as e:
+                    print(f"[sched] {jid}: delivery error: {e}", flush=True)
             _post_wake.set()
 
 
@@ -1036,17 +1421,36 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
         if path == "/library" and self._authed():
+            mf = _mf("jambo" if "site=jambo" in self.path else "snora")
+            is_jambo = mf is JAMBO
             items = []
-            for a in SHACK.get("assets", []):
+            for a in mf.get("assets", []):
+                ext = a.get("ext") or ("jpg" if is_jambo else "png")
                 items.append({"key": a["key"], "type": "image", "set": a.get("set", ""),
                               "name": a.get("key", "").replace("_", " "), "desc": a.get("desc", ""),
-                              "r2": f"library/{a['key']}.png"})
-            v = SHACK.get("character", {}).get("voice", {})
+                              "r2": f"library/{a['key']}.{ext}"})
+            v = _mf_voice(mf)
             if v.get("key"):
                 items.append({"key": v["key"], "type": "voice", "set": "voices",
                               "name": f"{v.get('key','')} voice (reference)", "desc": v.get("desc", ""),
                               "r2": f"library/voice_{v['key']}.wav"})
             return self._send({"items": items})
+        if path == "/stills" and self._authed():
+            with _lock:
+                st = _load_state()
+            items = []
+            for s in (st.get("stills") or {}).values():
+                items.append({"id": s["id"], "prompt": s.get("prompt", ""),
+                              "aspect": s.get("aspect"), "quality": s.get("quality"),
+                              "created": s.get("created"), "source": s.get("source"),
+                              "status": s.get("status", "done"),
+                              "transparent": bool(s.get("transparent")),
+                              "ext": s.get("ext"), "error": s.get("error"),
+                              "reply": s.get("reply", ""),
+                              "r2": bool(s.get("r2")),
+                              "url": f"/api/sora/still/{s['id']}"})
+            items.sort(key=lambda x: x.get("created") or 0, reverse=True)
+            return self._send({"stills": items[:80]})
         if path == "/health":
             info = {"ok": True, "backend": CONFIG["backend"]}
             if CONFIG["backend"] == "vpipe":
@@ -1080,6 +1484,35 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/jobs":
             jobs = sorted(state["jobs"].values(), key=lambda j: -j["created"])[:100]
             return self._send({"jobs": [self._public(j) for j in jobs]})
+        # ── the chron lane: schedules + the Discord picker ──────────────
+        if path == "/schedule":
+            scheds = state.get("schedules", [])
+            return self._send({
+                "schedules": scheds,
+                "now": time.time(),
+                "tz": SCHED.DEFAULT_TZ,
+                "describe": {s["id"]: SCHED.describe(s) for s in scheds},
+            })
+        if path == "/schedule/guilds":
+            try:
+                return self._send({"guilds": SCHED.list_guilds(CONFIG)})
+            except Exception as e:
+                return self._send({"error": f"discord lookup failed: {e}"}, 502)
+        m = re.fullmatch(r"/schedule/guilds/(\d+)/channels", path)
+        if m:
+            try:
+                return self._send({"channels": SCHED.list_text_channels(m.group(1), CONFIG)})
+            except Exception as e:
+                return self._send({"error": f"discord lookup failed: {e}"}, 502)
+        m = re.fullmatch(r"/schedule/([a-z0-9_]+)", path)
+        if m:
+            for s in state.get("schedules", []):
+                if s["id"] == m.group(1):
+                    return self._send(s)
+            return self._send({"error": "not found"}, 404)
+        if path == "/schedule/songs":
+            return self._send({"songs": [{k: v for k, v in s.items() if k != "lyric"}
+                                         for s in SCHED.DOG_SONGS]})
         m = re.fullmatch(r"/jobs/([a-z0-9_]+)/refs", path)
         if m:
             job = state["jobs"].get(m.group(1))
@@ -1153,8 +1586,88 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authed():
             return self._send({"error": "unauthorized"}, 401)
+        path = self.path.split("?")[0].rstrip("/")
+        # ── the chron lane ──────────────────────────────────────────────
+        if path == "/schedule":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                data = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                return self._send({"error": "bad json"}, 400)
+            name = str(data.get("name") or "").strip()[:80]
+            if not name:
+                return self._send({"error": "a schedule needs a name"}, 400)
+            targets = data.get("targets")
+            if not isinstance(targets, list) or not targets:
+                return self._send({"error": "pick at least one delivery target"}, 400)
+            rec = SCHED.new_schedule(
+                name,
+                kind=data.get("kind") or "singing_dog",
+                interval_hours=data.get("interval_hours") or 2,
+                quiet_start=data.get("quiet_start", 0),
+                quiet_end=data.get("quiet_end", 8),
+                tz=data.get("tz") or SCHED.DEFAULT_TZ,
+                targets=targets,
+                enabled=bool(data.get("enabled", True)),
+                duration=data.get("duration") or 8,
+                quality=data.get("quality") or "standard",
+                aspect=data.get("aspect") or "vertical",
+                image_key=data.get("image_key"),
+                payload=data.get("payload"),
+            )
+            store = _load_schedules()
+            store.append(rec)
+            _save_schedules(store)
+            print(f"[sched] created {rec['id']} {name} every {rec['interval_hours']}h "
+                  f"(quiet {rec['quiet_start']:02d}-{rec['quiet_end']:02d} {rec['tz']})", flush=True)
+            return self._send({"schedule": rec, "describe": SCHED.describe(rec)}, 201)
+        m = re.fullmatch(r"/schedule/([a-z0-9_]+)/(toggle|run|delete)", path)
+        if m:
+            sid, action = m.group(1), m.group(2)
+            store = _load_schedules()
+            hit = next((s for s in store if s["id"] == sid), None)
+            if not hit:
+                return self._send({"error": "not found"}, 404)
+            if action == "toggle":
+                hit["enabled"] = not hit.get("enabled")
+                if hit["enabled"]:
+                    SCHED.advance(hit)          # never fire the moment it is switched on
+                _save_schedules(store)
+                return self._send({"schedule": hit, "describe": SCHED.describe(hit)})
+            if action == "delete":
+                store.remove(hit)
+                _save_schedules(store)
+                return self._send({"deleted": sid})
+            # run now — QUIET HOURS STILL APPLY (Eric's rule), so this either
+            # enqueues immediately or tells you why it refuses.
+            if not SCHED.in_active_window(hit):
+                z = SCHED.zone_of(hit)
+                return self._send(
+                    {"error": f"{hit['name']} is in quiet hours "
+                              f"(quiet {hit['quiet_start']:02d}:00–{hit['quiet_end']:02d}:00) — "
+                              f"nothing queues until the window opens."}, 409)
+            try:
+                built = SCHED.build_job(hit)
+            except Exception as e:
+                return self._send({"error": f"could not build the job: {e}"}, 400)
+            payload = built["payload"]
+            meta = built.get("meta", {})
+            try:
+                jid = _enqueue_payload(payload, f"sched:{hit['id']}")
+            except Exception as e:
+                return self._send({"error": f"enqueue failed: {e}"}, 502)
+            hit["last_run"] = time.time()
+            hit["last_job_id"] = jid
+            hit["last_song_id"] = meta.get("song_id")
+            hit["last_song_title"] = meta.get("song_title")
+            hit["last_song_lang"] = meta.get("song_lang")
+            hit["pending_job"] = jid
+            hit["delivered"] = False
+            _save_schedules(store)
+            print(f"[sched] {sid}: run-now queued {jid}", flush=True)
+            return self._send({"job_id": jid, "schedule": hit}, 201)
         m = re.fullmatch(r"/jobs/([a-z0-9_]+)/approve", self.path.split("?")[0].rstrip("/"))
-        if m:  # the approval gate — the user's tap is the only thing that opens it
+        if m:  # the approval gate — Eric's tap is the only thing that opens it
             jid = m.group(1)
             with _lock:
                 state = _load_state()
@@ -1204,7 +1717,7 @@ class Handler(BaseHTTPRequestHandler):
                     _save_state(state)
             removed, kept = [], []
             # Sweep this job's own derived artifacts. Uploaded photos and the
-            # uploaded voice stay (the user keeps his originals); _delete_guarded
+            # uploaded voice stay (Eric keeps his originals); _delete_guarded
             # enforces the sandbox realpath + never-an-original rules in code.
             _delete_guarded(os.path.join(CONFIG["vpipe_sandbox"], "sora", f"{jid}.mp4"),
                             removed, kept)
@@ -1234,8 +1747,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"ok": True, "removed": removed, "kept": kept})
         if self.path.split("?")[0].rstrip("/") == "/clear_queue":
             # Cancel everything still waiting — queued AND gated (a gated job
-            # is waiting for the user, it is not rendering). The job currently
-            # rendering keeps going; uploads stay on disk (the user keeps photos).
+            # is waiting for Eric, it is not rendering). The job currently
+            # rendering keeps going; uploads stay on disk (Eric keeps photos).
             with _lock:
                 state = _load_state()
                 waiting = sorted((jid for jid, j in state["jobs"].items()
@@ -1279,6 +1792,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.log_message("cancel: killing render %s", jid)
                     return self._send({"ok": True, "killing": jid})
                 return self._send({"error": f"cannot cancel a {st} job"}, 400)
+        if self.path.split("?")[0].rstrip("/") == "/stills":
+            if not self._authed():
+                return self._send({"error": "unauthorized"}, 401)
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                data = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                return self._send({"error": "bad json"}, 400)
+            res, code = _still_create(data, self._client_ip())
+            return self._send(res, code)
         if self.path.split("?")[0].rstrip("/") == "/sequence":
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -1290,7 +1813,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"error": "shots required"}, 400)
             # The approval gate is farm law, not app manners. /sequence is the lane
             # the cockpit routes agent-planned films onto, so it gates BY DEFAULT:
-            # nothing an agent planned can reach the GPU until the user taps approve.
+            # nothing an agent planned can reach the GPU until Eric taps approve.
             # (Manual single-shot RENDER IT is unaffected — /jobs still defaults to
             # await_approval=false, per the spec.)
             await_approval = bool(data.get("await_approval", True))
@@ -1314,16 +1837,17 @@ class Handler(BaseHTTPRequestHandler):
                         f"{s['prompt']}{time.time()}{i}".encode()).hexdigest()[:8]
                     seed = random.getrandbits(63)
                     image_path = None
+                    mf = _mf(data.get("site"))
                     if i == 0 and s.get("image_key"):
-                        for a in SHACK.get("assets", []):
+                        for a in mf.get("assets", []):
                             if a["key"] == s["image_key"]:
                                 image_path = a["file"]
                                 break
                     # chains share ONE canvas — mixed orientations are what makes a sequence cursed
                     aspect = chain_aspect
-                    if s.get("voice") and i > 0 and s.get("voice_key", DEFAULT_VOICE_KEY) == DEFAULT_VOICE_KEY:
-                        # VO shot: ref2va standalone with the user's face + voice
-                        for a in SHACK.get("assets", []):
+                    if s.get("voice") and i > 0 and s.get("voice_key") == _mf_voice(mf).get("key"):
+                        # VO shot: ref2va standalone with this lane's face + voice
+                        for a in mf.get("assets", []):
                             if a["key"] == s.get("image_key"):
                                 break
                     tr = s.get("transition") if s.get("transition") in (
@@ -1339,15 +1863,19 @@ class Handler(BaseHTTPRequestHandler):
                         "sequence": {"id": seq_id, "index": i, "count": len(shots), "prev_id": prev_id,
                                      "transition": tr if i > 0 else "chain"},
                         "title": str(s.get("title", f"shot {i+1}"))[:60],
+                        "soundscape": str(s.get("soundscape") or "")[:600],
+                        "music": str(s.get("music") or "")[:300],
                         "backend": CONFIG["backend"], "status": "awaiting_approval" if await_approval else "queued", "ip": ip,
+                        "source": (str(data.get("source"))[:60] if data.get("source") else None),
+                        "lang": "sw" if str(data.get("site") or "").strip().lower() == "jambo" else None,
                         "created": base_time + i * 0.001, "seed": seed,
                     }
-                    # VO shots: standalone ref2va with the user's face + voice
+                    # VO shots: standalone ref2va with this lane's face + voice
                     if s.get("voice") and s.get("image_key"):
-                        for a in SHACK.get("assets", []):
+                        for a in mf.get("assets", []):
                             if a["key"] == s["image_key"]:
                                 job["image_path"] = a["file"]
-                                job["voice_path"] = SHACK.get("character", {}).get("voice", {}).get("file")
+                                job["voice_path"] = _mf_voice(mf).get("file")
                                 job["sequence"]["transition"] = "cut"
                                 break
                     state["jobs"][job_id] = job
@@ -1418,9 +1946,10 @@ class Handler(BaseHTTPRequestHandler):
         image_path = voice_path = None
         end_image_path = None
         key_paths = []
+        mf = _mf(data.get("site"))
         for k in (data.get("image_keys") or [])[:9]:
             if isinstance(k, str) and re.fullmatch(r"[a-z0-9_]+", k):
-                for a in SHACK.get("assets", []):
+                for a in mf.get("assets", []):
                     if a["key"] == k:
                         key_paths.append(a["file"])
                         break
@@ -1446,21 +1975,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"error": str(e)}, 400)
         if voice_path:
             voice_path = _to_wav(voice_path)
-        # builder library references (validated against the manifest)
+        # builder library references (validated against this lane's manifest)
         if not image_path and data.get("image_key"):
-            for a in SHACK.get("assets", []):
+            for a in mf.get("assets", []):
                 if a["key"] == data["image_key"]:
                     image_path = a["file"]
                     break
         if not voice_path and data.get("voice_key"):
-            if data["voice_key"] == DEFAULT_VOICE_KEY:
-                voice_path = SHACK.get("character", {}).get("voice", {}).get("file")
+            v = _mf_voice(mf)
+            if data["voice_key"] == v.get("key"):
+                voice_path = v.get("file")
                 if voice_path and not os.path.exists(voice_path):
                     voice_path = None
         if voice_path and not image_path:
             return self._send({"error": "voice needs an image"}, 400)
         if not end_image_path and data.get("end_image_key"):
-            for aa in SHACK.get("assets", []):
+            for aa in mf.get("assets", []):
                 if aa["key"] == data["end_image_key"]:
                     end_image_path = aa["file"]
                     break
@@ -1502,14 +2032,19 @@ class Handler(BaseHTTPRequestHandler):
                 "quality": quality, "aspect": aspect, "duration": duration,
                 "target_ratio": target_ratio,
                 "source": source,
+                "lang": "sw" if str(data.get("site") or "").strip().lower() == "jambo" else None,
                 "has_image": bool(image_path), "has_voice": bool(voice_path),
+                # the official overall_soundscape / non_diegetic_music fields: the
+                # planner's own words when it wrote them, else the scaffold default
+                "soundscape": str(data.get("soundscape") or "")[:600],
+                "music": str(data.get("music") or "")[:300],
                 "ref_mode": ref_mode, "zoom": zoom, "focus": focus,
                 "image_path": image_path or (key_paths[0] if key_paths else None),
                 "image_paths": key_paths,
                 "end_image_path": end_image_path,
                 "voice_path": voice_path,
                 "backend": CONFIG["backend"],
-                # gated jobs wait for the user's tap; everything else queues
+                # gated jobs wait for Eric's tap; everything else queues
                 # exactly as today (manual RENDER IT is already an approval)
                 "status": "awaiting_approval" if await_approval else "queued",
                 "ip": ip,
@@ -1554,10 +2089,40 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _sync_cuts():
-    """OPTIONAL hook: pull reference clips into the render box so the Shot
-    Planner can point commands at real local files. Left inert for a fresh
-    install — wire it to your own asset source if you want live uploads."""
-    return
+    """Mirror any workshop cuts (eli-tv uploads on R2) into ~/johnnyb_h3/inputs/cuts/
+    so Shot Planner commands reference real local files."""
+    import shutil
+    cuts_dir = f"{HOME}/johnnyb_h3/inputs/cuts"
+    os.makedirs(cuts_dir, exist_ok=True)
+    url = "https://snail3d.com/api/elitv/manifest"
+    # token comes from the elitv worker (same password hash scheme) — stored beside config
+    tok_file = os.path.join(HERE, "elitv_token.txt")
+    if not os.path.exists(tok_file):
+        return
+    token = open(tok_file).read().strip()
+    req = urllib.request.Request(url, headers={"X-EliTV-Token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            manifest = json.loads(resp.read().decode())
+    except Exception:
+        return
+    for item in manifest.get("uploads", []):
+        name = item["name"]
+        dest = os.path.join(cuts_dir, name)
+        if os.path.exists(dest):
+            continue
+        try:
+            areq = urllib.request.Request(
+                f"https://snail3d.com/api/elitv/asset/{item['key']}",
+                headers={"X-EliTV-Token": token})
+            with urllib.request.urlopen(areq, timeout=60) as r:
+                data = r.read()
+            with open(dest + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(dest + ".tmp", dest)
+            print(f"[sora] synced cut {name}", flush=True)
+        except Exception as e:
+            print(f"[sora] cut sync {name}: {e}", flush=True)
 
 
 def _cuts_sync_loop():
@@ -1581,43 +2146,46 @@ def _load_shack():
 
 SHACK = _load_shack()
 
-
-def _sets_brief():
-    """One WORLD line per set defined in shack_manifest.json (the buyer's own)."""
-    lines = []
-    for st in SHACK.get("sets", []):
-        lines.append(f"- Set {st.get('name', 'SET')} ({st.get('aliases', '')}): "
-                     f"{st.get('desc', 'describe your set in shack_manifest.json')}.\n")
-    return "".join(lines) or "- (no sets yet — add them under \"sets\" in shack_manifest.json)\n"
+# ── the Jambo manifest: a second, Kenyan reference library for the promo lane ──
+JAMBO_MANIFEST_FILE = os.path.join(HERE, "jambo_manifest.json")
 
 
-def _voice_brief():
-    v = SHACK.get("character", {}).get("voice", {})
-    if v.get("key"):
-        return (f"- The subject's voice reference is available (voice key "
-                f"'{v['key']}'): {v.get('desc', 'your voice')}.\n")
-    return ""
+def _load_jambo():
+    try:
+        return json.load(open(JAMBO_MANIFEST_FILE))
+    except Exception:
+        return {"character": {}, "assets": []}
 
 
-DEFAULT_VOICE_KEY = SHACK.get("character", {}).get("voice", {}).get("key", "myvoice")
+JAMBO = _load_jambo()
+
+
+def _mf(site):
+    """Which reference library this request belongs to. One service, two lanes."""
+    return JAMBO if str(site or "").strip().lower() == "jambo" else SHACK
+
+
+def _mf_voice(mf):
+    return (mf.get("character") or {}).get("voice") or {}
 
 
 def _builder_system():
     lib = [{"key": a["key"], "set": a["set"], "desc": a["desc"]} for a in SHACK.get("assets", [])]
     return (
-        "You are the sNora Scene Builder — a master director/showrunner who chats with the user, plans MiniMax H3 video shots for the render farm, and directs their continuity.\n\n"
-        "WORLD — the user's standing character and sets (edit shack_manifest.json to describe YOURS):\n"
-        f"- The star is {SHACK.get('character', {}).get('name', 'the user')}: {SHACK.get('character', {}).get('look', 'describe your recurring subject in shack_manifest.json')}. Any mention of 'me', 'my', 'I' = this subject.\n"
-        f"{_sets_brief()}"
-        f"{_voice_brief()}\n\n"
-        "NAMING — SAY THE REAL NAMES (casting/direction notes for the user's own render farm, not public claims):\n"
-        "- When the user's words point at a real actor, character, film, show, brand, landmark or studio, the job prompt carries THAT NAME — plus the specific film and scene when it helps. Hedging is a defect: a vague descriptor renders as generic mush; the name is what steers the shot.\n"
-        "- Never 'a rugged action star' — name the actor. Never 'a familiar cartoon creature' — name it. Never 'in the style of a big animation studio' — name the studio and describe its look. Casting specificity is what steers the shot.\n"
+        "You are the sNora Scene Builder — a master director/showrunner who chats with Eric, plans MiniMax H3 video shots for the render farm, and directs their continuity.\n\n"
+        "WORLD:\n"
+        f"- The star is Eric: {SHACK.get('character', {}).get('look', 'man in cap and robe')}. Any mention of 'me', 'my', 'I' = Eric.\n"
+        "- Set SNAIL SHACK ('the shack', 'the office', 'my workshop'): backyard shed workshop, usually NIGHT — warm LED bar light, dark sloped ceiling, pegboard tool wall, parts drawers, 'The Office' sign, worn brown leather chair, white marble-topped desks, Persian rug, Bambu P2S 3D printer corner.\n"
+        "- Set BACKYARD PATIO ('outside', 'backyard', 'the hammock'): night — warm string lights in a tree with a white hanging hammock chair, green turf, lit brown privacy fence, covered patio with green cushions, shed in the background.\n"
+        "- Eric's own voice reference is available (voice key 'eric'): casual American male.\n\n"
+        "NAMING — SAY THE REAL NAMES (casting and direction notes for Eric's own render farm, not public claims):\n"
+        "- When Eric's words point at a real actor, character, film, show, brand, landmark or studio, the job prompt carries THAT NAME — plus the specific film and scene when it helps. Hedging is a defect: a vague descriptor renders as generic mush; the name is what steers the shot.\n"
+        "- Never 'a rugged action star' — write 'Arnold Schwarzenegger, bison-ranch hand'. Never 'reminiscent of a 90s cop movie' — write 'the Kindergarten Cop classroom scene, same energy'. Never 'a familiar blue hedgehog' — write 'Sonic the Hedgehog, doing the farm chores'. Never 'in the style of Pixar' — write 'Pixar short-film look: big eyes, warm rim light'.\n"
         "- Banned hedges, never in a prompt/goal/reply: 'inspired by', 'in the vein of', 'a certain', 'evoking', 'somewhat like'.\n"
-        "- A shoutout line from the user — their own brands or any name they lift — is dialogue content carried verbatim, not advertising to soften.\n"
-        "- Casting language, not false claims: 'a named star as the ranch hand' (a direction to the renderer) — but never state as fact that someone starred in, endorsed, or appears in the user's clip.\n"
-        "- The carve-out — the user's own family and their photos: keep them relational ('the kid', 'his wife') with his reference photos; never guess at names for people he knows.\n"
-        "- No apologies, no disclaimers, no safety preambles — not in a job prompt, not anywhere. Whether to publish a clip is the user's call with the finished clip in front of them; the prompt's job is to name the shot they asked for, not to hide the choice from him.\n\n"
+        "- A shoutout line from Eric — his brands (Snail3D, sNora) or any name he lifts — is dialogue content carried verbatim, not advertising to soften.\n"
+        "- Casting language, not false claims: 'Arnold Schwarzenegger as the ranch hand' (a direction to the renderer) — but never state as fact that someone starred in, endorsed, or appears in Eric's clip.\n"
+        "- The carve-out — Eric's own family and their photos: keep them relational ('the kid', 'his wife') with his reference photos; never guess at names for people he knows.\n"
+        "- No apologies, no disclaimers, no safety preambles — not in a job prompt, not anywhere. Whether to publish a clip is Eric's call with the finished clip in front of him; the prompt's job is to name the shot he asked for, not to hide the choice from him.\n\n"
         "IMAGE LIBRARY (use these exact keys in shots.image):\n"
         f"{json.dumps(lib, indent=1)}\n\n"
         "== THE DIRECTOR'S HANDBOOK ==\n"
@@ -1641,14 +2209,14 @@ def _builder_system():
         "ZOOM & CROP TOOL (how you get different angles from one photo):\n"
         "- The farm crops/zooms reference photos to the canvas — it NEVER stretches them. So different angles come from choosing zoom + focus on the SAME master photo.\n"
         "- shots.zoom: 1.0 = full frame, 1.5 = medium close, 2.0-2.5 = close-up. shots.focus: 'face' (bias to the face), 'top', 'center'.\n"
-        "- Example: one wide set master at zoom 1.0 is the establishing shot; the same photo at zoom 2.0/focus 'face' is the close-up. That's how you build coverage — derive, don't invent.\n"
+        "- Example: one wide shack master at zoom 1.0 is the establishing shot; the same photo at zoom 2.0/focus 'face' is the close-up. That's how you build coverage — derive, don't invent.\n"
         "- In a chain, zooming IN across shots (1.0 → 1.4 → 2.0) creates a natural push-in feel.\n"
         "- All shots in one chain share ONE aspect ratio (the first shot's) — mixed orientations in a sequence are forbidden.\n\n"
         "REFERENCE INTENT — THE MOST IMPORTANT ROUTING DECISION:\n"
         "Every shot that uses an image must set ref_mode:\n"
-        "- ref_mode='scene' — the photo's LOCATION AND TIME OF DAY ARE the scene (first-frame anchor). Use ONLY when the user wants to continue in the photo's actual setting (same place, same time of day).\n"
-        "- ref_mode='identity' — the photo defines WHO the subject is, NOT where they are. Use whenever the user describes a NEW OR DIFFERENT setting from the photo: different location, daytime when the photo is night, a whole new world (the beach, space, a fantasy set). Ref2VA carries the subject into the freshly-prompted scene.\n"
-        "- If the user's described scene matches no library photo's setting: either (a) ref_mode='identity' with the closest subject image — the prompt's scene wins, or (b) image=null with a rich character description in the prompt (pure text-to-video).\n"
+        "- ref_mode='scene' — the photo's LOCATION AND TIME OF DAY ARE the scene (first-frame anchor). Use ONLY when Eric wants to continue in the photo's actual setting (the shack at night, the backyard at night).\n"
+        "- ref_mode='identity' — the photo defines WHO Eric is, NOT where he is. Use whenever Eric describes a NEW OR DIFFERENT setting from the photo: different location, daytime when the photo is night, a whole new world (Andy's room, the beach, space). Ref2VA carries Eric into the freshly-prompted scene.\n"
+        "- If Eric's described scene matches no library photo's setting: either (a) ref_mode='identity' with the closest Eric image — the prompt's scene wins, or (b) image=null with a rich character description in the prompt (pure text-to-video).\n"
         "- NEVER use ref_mode='scene' just because a nice photo exists — that pins the photo's background onto the clip. This is the #1 failure mode.\n"
         "- Library images carry scene tags in their descriptions ('night'/'day'/'golden hour' + location) — match scene AND time when anchoring.\n\n"
         "CONTINUITY & TRANSITIONS — two tools plus a effects rack, choose deliberately:\n"
@@ -1659,78 +2227,191 @@ def _builder_system():
         "- Chained shots: write openings that MATCH the previous ending (pose, camera framing, energy). Cut/effect shots: write as fresh starts — reuse the set's base image key for the new angle, or image=null for time skips.\n"
         "- Shots in the same location (non-chained) use the SAME base image key. Establishing/empty-set shots use the *_wide / corner keys.\n"
         "VOICEOVER — a first-class tool:\n"
-        "- On-camera dialogue: <d>[English] the words</d> + voice=true (the subject's reference voice, Ref2VA pipeline).\n"
-        "- OFF-SCREEN VOICEOVER ( narration over any scene ): voice=true AND prompt phrased exactly like: 'the subject narrates in an off-screen voiceover — <the narration>, while their lips remain completely closed' or 'says in an off-screen voiceover ... while his lips remain completely closed'. For pure b-roll narration use image=null in chained plans, or the subject shot with image=<a pose key>. VO shots work best as their own shot (transition='cut' into or out of them).\n"
+        "- On-camera dialogue: <d>[English] the words</d> + voice=true (Eric's reference voice, Ref2VA pipeline).\n"
+        "- OFF-SCREEN VOICEOVER ( narration over any scene ): voice=true AND prompt phrased exactly like: 'Eric narrates in an off-screen voiceover — <the narration>, while his lips remain completely closed' or 'says in an off-screen voiceover ... while his lips remain completely closed'. For pure b-roll narration use image=null in chained plans, or the subject shot with image=<Eric pose key>. VO shots work best as their own shot (transition='cut' into or out of them).\n"
         "- Max ~2 short VO beats (≤10 words each) per 5s clip; insert silent visual beats between dense narration.\n"
-        "- No dialogue = ambient sound only. Music only via non_diegetic_music when the user asks.\n"
+        "- No dialogue = ambient sound only. Music only via non_diegetic_music when Eric asks.\n"
         "- Single (non-chained) image shots: the image becomes BOTH first and last frame — write motion that starts and settles near that pose.\n\n"
         "DIALOGUE DISCIPLINE — every spoken line, VO or on-camera:\n"
         "- Word budget ≈ 2.2 spoken words per second of clip: 3s≤7, 5s≤11, 8s≤18, 10s≤22, 15s≤33. The farm 400s an over-budget line.\n"
         "- Banned filler in any spoken line: hey, hey y'all, y'all, just, literally, like, you know, I mean, uh, um, basically, actually, guys, okay so, 'so' as an opener, 'well' as an opener.\n"
         "- A spoken line must NEVER narrate what the shot already shows — it adds a want, a joke, a name, a memory.\n"
         "- One intent per line; one speaker per shot. Write it as: He says, <emotion>: \"<line>\" — placed at the END of the scene description, before the Soundscape line.\n"
-        "- When the scene invites words and the user gave none, WRITE one line that fits the budget (proactive fill-in); a line over budget gets rewritten shorter, meaning and voice intact.\n"
+        "- When the scene invites words and Eric gave none, WRITE one line that fits the budget (proactive fill-in); a line over budget gets rewritten shorter, meaning and voice intact.\n"
         "- Leave at least 30% of the clip wordless so the delivery can breathe.\n\n"
-        "IMAGE LIBRARY pose rules: match the shot's action to the pose in the key (match action to pose — desk keys for desk shots, chair keys for talking-to-camera, outdoor keys for outside).\n\n"
+        "IMAGE LIBRARY pose rules: match the shot's action to the pose in the key (typing keys for typing shots, chair keys for talking-to-camera, backyard keys for outdoor).\n\n"
         "OUTPUT — strict JSON only, no markdown fences:\n"
-        '{"reply": "<1-3 friendly sentences to the user>", "goal": "<one-sentence synopsis of the whole scene>", '
+        '{"reply": "<1-3 friendly sentences to Eric>", "goal": "<one-sentence synopsis of the whole scene>", '
         '"shots": [{"title": "short name", "prompt": "<complete scene: action + camera + any dialogue>", "aspect": "square", "duration": 5, "quality": "standard", "image": "<library key or null>", "voice": false, "transition": "chain", "ref_mode": "scene"}]}\n'
         "(shots.transition ∈ chain|cut|dissolve|fade|dip|flash|slide|wipe|whip|glitch|iris; shots.ref_mode ∈ scene|identity; the FIRST shot's transition is ignored.)"
     )
 
 
-def _builder_plan(message, history):
+def _jambo_system():
+    lib = [{"key": a["key"], "set": a.get("set", ""), "desc": a["desc"]}
+           for a in JAMBO.get("assets", [])]
+    return (
+        "Wewe ni JAMBO — mkurugenzi wa matangazo ya video na picha kwa biashara ndogo katika "
+        "Kenya na Afrika Mashariki. You are JAMBO, a promo director for small East African "
+        "businesses: dukas, salons, phone shops, tailors, produce stalls, boda boda riders, "
+        "restaurants, matatus and market traders.\n\n"
+        "LUGHA — THE FIRST RULE:\n"
+        "- Reply to the user in simple, warm KISWAHILI. Keep it to 1-3 sentences.\n"
+        "- Every spoken line is SWAHILI and written exactly as: <d>[Swahili] the words</d>.\n"
+        "- Never write English dialogue. Swahili words are never 'English'.\n"
+        "- Write the Swahili a market trader actually speaks, not textbook Swahili.\n"
+        "  Good: 'Karibu! Bei nafuu leo.' · 'Bidhaa zetu ni za ubora.' · 'Tunafanya kazi kwa haraka.'\n"
+        "  Good CTA: 'Njoo leo!' · 'Tupigie simu.' · 'Karibu dukani.'\n\n"
+        "PHONE-FIRST (9:16):\n"
+        "- The audience watches on a phone. Unless told otherwise EVERY shot uses "
+        "aspect \"vertical\" (9:16). Never mix orientations in one film.\n"
+        "- Compose for the phone: subject centred, faces in the upper third, clear space "
+        "at the bottom for shop name and phone number.\n\n"
+        "BUSINESS PROMO CRAFT:\n"
+        "- A promo is short: hook in the first second, the product/service clearly shown, one "
+        "benefit, one call to action, the shop name and phone number at the end.\n"
+        "- Show real work: hands, tools, product close-ups, the owner smiling at the camera, "
+        "the shopfront, the queue, the delivery.\n"
+        "- On-screen text goes in DOUBLE QUOTES exactly as asked, e.g. \"JAMBO SALON - KARIBU SANA\".\n"
+        "- Sound: diegetic shop ambience by default; music only when asked (non_diegetic_music).\n\n"
+        "NAMING — SAY THE REAL NAMES:\n"
+        "- When the user names a shop, brand, product or place, carry THAT NAME verbatim in the "
+        "prompt. Hedging ('a certain shop', 'some salon') is a defect — the name is what steers "
+        "the shot.\n"
+        "- A shop's own name and phone number are content, not advertising to soften — keep them exact.\n\n"
+        "IMAGE LIBRARY — KENYAN LOCATIONS (use these exact keys in shots.image):\n"
+        f"{json.dumps(lib, indent=1)}\n\n"
+        "REFERENCE INTENT — every shot that uses an image must set ref_mode:\n"
+        "- ref_mode='scene' — the library photo's LOCATION IS the scene. Use the Kenyan market, "
+        "street, shop and savanna shots as the setting.\n"
+        "- ref_mode='identity' — the photo defines WHO the subject is; the scene comes from the idea. "
+        "Use for a user-uploaded photo of the owner or their product.\n"
+        "- image=null gives a pure text-to-video scene — best when no library photo fits.\n\n"
+        "DIALOGUE DISCIPLINE:\n"
+        "- Word budget ≈ 2.2 spoken words per second: 3s≤7, 5s≤11, 8s≤18, 10s≤22, 15s≤33. "
+        "An over-budget line is rejected by the farm.\n"
+        "- Leave at least a third of the clip wordless so the delivery can breathe.\n"
+        "- One speaker per shot, one intent per line.\n\n"
+        "SHOT BUDGETS: 5s = one beat. 8s = two beats. 10-15s = 2-4 shots written as "
+        "[Shot 1] ... [Shot 2 At 00:05.000] ... with strictly increasing timestamps.\n"
+        "CAMERA: write ONE move per shot as prose — 'the camera holds steady', 'slow push in', "
+        "'pans right across the stall'. Always say what the camera does.\n\n"
+        "OUTPUT — strict JSON only, no markdown fences:\n"
+        '{"reply": "<1-3 sentences in Kiswahili>", "goal": "<one-sentence synopsis>", '
+        '"shots": [{"title": "short name", "prompt": "<complete scene: action + camera + Swahili dialogue>", '
+        '"aspect": "vertical", "duration": 5, "quality": "standard", "image": "<library key or null>", '
+        '"voice": false, "transition": "chain", "ref_mode": "scene"}]}\n'
+        "(shots.aspect is 'vertical' for phone promos. shots.voice is false — Swahili is spoken "
+        "natively from the <d> tag, no voice reference needed. shots.transition ∈ "
+        "chain|cut|dissolve|fade|dip|flash|slide|wipe|whip|glitch|iris; shots.ref_mode ∈ scene|identity. "
+        "The FIRST shot's transition is ignored.)"
+    )
+
+
+def _jambo_still_system():
+    return (
+        "You write ONE prompt for a text-to-image model (Qwen-Image) that paints a promotional "
+        "photo for a small business in Kenya.\n"
+        "Write the image prompt in ENGLISH — the image model reads English — describing the "
+        "FINISHED FRAME only. No commands, no 'generate', no camera instructions.\n"
+        "Include subject, setting, light, mood and composition; use 8-14 concrete phrases.\n"
+        "If the user wants words in the picture, put them in DOUBLE QUOTES exactly as asked: "
+        "\"JAMBO SALON\".\n"
+        "Kenyan context that helps: matatus, dukas, kitenge fabrics, produce markets, acacia, "
+        "baobab, warm golden light, red earth.\n"
+        "Phone-first: default aspect \"portrait\" (9:16). Never mention resolution or aspect "
+        "inside the prompt.\n"
+        "Reply in strict JSON only: "
+        '{"reply": "<1-2 sentences in Kiswahili>", "prompt": "<the image prompt>", '
+        '"aspect": "portrait|square|wide", "mood": "<one word>"}'
+    )
+
+
+def _builder_plan(message, history, site=None):
     base = CONFIG.get("snail_api_base")
     key = CONFIG.get("snail_api_key")
     if not base or not key:
         raise RuntimeError("snail-api key not configured")
-    msgs = [{"role": "system", "content": _builder_system()}]
+    # FIRE_RULE + CONTRACT: fire is opt-in, and the official H3 writing rules.
+    # H3 is CFG-distilled, so there is no negative prompt to fall back on.
+    system_prompt = ((_jambo_system() if str(site or "").strip().lower() == "jambo"
+                      else _builder_system()) + FIRE_RULE + CONTRACT)
+    msgs = [{"role": "system", "content": system_prompt}]
     for h in (history or [])[-6:]:
         role = h.get("role", "user")
         if role in ("user", "assistant"):
             msgs.append({"role": role, "content": str(h.get("content", ""))[:2000]})
     msgs.append({"role": "user", "content": message[:2000]})
-    req = urllib.request.Request(
-        base + "/chat/completions",
-        data=json.dumps({"model": CONFIG.get("snail_model", "snail-top"),
-                         "messages": msgs, "max_tokens": 2500, "temperature": 0.7}).encode(),
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        method="POST")
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        d = json.loads(resp.read().decode())
-    content = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-    content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.S)
-    m = re.search(r"\{.*\}", content, re.S)
-    if not m:
-        return {"reply": content[:500] or "(no plan returned)", "shots": []}
-    plan = None
-    for attempt in (m.group(0), re.sub(r",\s*([}\]])", r"\1", m.group(0))):
-        try:
-            plan = json.loads(attempt)
+    fire_ok = wants_fire(message)
+    plan = {}
+    for fire_try in (1, 2):
+        req = urllib.request.Request(
+            base + "/chat/completions",
+            data=json.dumps({"model": CONFIG.get("snail_model", "snail-top"),
+                             "messages": msgs, "max_tokens": 2500, "temperature": 0.7}).encode(),
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            d = json.loads(resp.read().decode())
+        content = (d.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.S)
+        m = re.search(r"\{.*\}", content, re.S)
+        if not m:
+            return {"reply": content[:500] or "(no plan returned)", "shots": []}
+        plan = None
+        for attempt in (m.group(0), re.sub(r",\s*([}\]])", r"\1", m.group(0))):
+            try:
+                plan = json.loads(attempt)
+                break
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(plan, dict):
+            return {"reply": content[:500], "shots": []}
+        # some models string-encode the plan inside "reply" — unwrap if so
+        if (not plan.get("shots") and isinstance(plan.get("reply"), str)
+                and plan["reply"].strip().startswith("{")):
+            try:
+                plan = json.loads(plan["reply"])
+            except json.JSONDecodeError:
+                pass
+        # Fire is opt-in and H3 has no negative prompt to lean on, so a planner
+        # that invents fire gets exactly ONE re-ask, with its own draft quoted
+        # back at it. See h3_prompt.py.
+        doors = []
+        for _s in (plan.get("shots") or []):
+            if isinstance(_s, dict):
+                _b, _f = clean_body(_s.get("prompt") or "")
+                doors.append(" ".join([_b, _f.get("overall_soundscape", ""),
+                                       _f.get("non_diegetic_music", "")]))
+        slip = [] if fire_ok else fire_slip_in(" ".join(doors), str(plan.get("goal") or ""))
+        if not slip:
             break
-        except json.JSONDecodeError:
+        if fire_try == 1:
+            print(f"[sora] plan invented fire ({', '.join(slip)}) for a no-fire ask "
+                  f"— re-asking: {message[:70]}", flush=True)
+            msgs.append({"role": "user",
+                         "content": fire_corrective(slip, "\n".join(doors)[:1500])})
             continue
-    if not isinstance(plan, dict):
-        return {"reply": content[:500], "shots": []}
-    # some models string-encode the plan inside "reply" — unwrap if so
-    if not plan.get("shots") and isinstance(plan.get("reply"), str) and plan["reply"].strip().startswith("{"):
-        try:
-            plan = json.loads(plan["reply"])
-        except json.JSONDecodeError:
-            pass
+        print(f"[sora] fire survived the re-ask ({', '.join(slip)}) — shipping the plan "
+              f"anyway", flush=True)
     valid_keys = {a["key"] for a in SHACK.get("assets", [])}
     shots = []
     for s in plan.get("shots", [])[:6]:
         if not isinstance(s, dict) or not s.get("prompt"):
             continue
+        # the scaffold owns the field labels: lift any the planner inlined
+        pbody, pfields = clean_body(s["prompt"])
         shots.append({
             "title": str(s.get("title", "shot"))[:60],
-            "prompt": str(s["prompt"])[:2000],
+            "prompt": pbody[:2000],
             "aspect": s.get("aspect") if s.get("aspect") in CONFIG["aspects"] else "square",
             "duration": int(s["duration"]) if int(s.get("duration", 5) or 5) in CONFIG["durations"] else 5,
             "quality": s.get("quality") if s.get("quality") in CONFIG["qualities"] else "standard",
             "image": s.get("image") if s.get("image") in valid_keys else None,
             "voice": bool(s.get("voice")),
+            "soundscape": str(s.get("soundscape") or pfields.get("overall_soundscape")
+                              or "")[:600],
+            "music": str(s.get("music") or pfields.get("non_diegetic_music") or "")[:300],
             "transition": s.get("transition") if s.get("transition") in (
                 "chain", "cut", "dissolve", "fade", "dip", "flash", "slide", "wipe", "whip", "glitch", "iris") else "chain",
             "zoom": min(2.5, max(1.0, float(s.get("zoom") or 1.0))),
@@ -1741,7 +2422,7 @@ def _builder_plan(message, history):
 
 
 # ── conversation memory ────────────────────────────────────────────────────
-# the user talks to the farm and expects it to remember. The phone used to be the only
+# Eric talks to the farm and expects it to remember. The phone used to be the only
 # place history lived (it sent `history` back on every turn), so a redo from the
 # Reel tab, a different device, or a fresh launch forgot everything he'd already
 # said. Turns live here now, keyed by a thread id the caller sticks to.
@@ -1808,16 +2489,16 @@ def _plan_digest(plan):
 
 
 def _redo_context(job_id, note):
-    """Rebuild 'what I made, and what the user says is wrong' into one instruction.
+    """Rebuild 'what I made, and what Eric says is wrong' into one instruction.
 
     A redo is not a fresh prompt: the brain has to see the take it already made
-    (its actual prompt and settings) plus the user's complaint, or it cheerfully
+    (its actual prompt and settings) plus Eric's complaint, or it cheerfully
     re-renders the thing he just rejected.
     """
     with _lock:
         job = _load_state()["jobs"].get(str(job_id))
     if not job:
-        return f"REDO request. the user is unhappy with a shot the farm made, but that " \
+        return f"REDO request. Eric is unhappy with a shot the farm made, but that " \
                f"job id is gone ({job_id}). Ask him what it was.\n" \
                f"HIS NOTE: {str(note)[:1200]}"
     made = (f"job {job.get('id')} | status={job.get('status')} | "
@@ -1827,12 +2508,12 @@ def _redo_context(job_id, note):
     if seq:
         made += f" | shot {int(seq.get('index', 0)) + 1} of {seq.get('count')}"
     return (
-        "REDO request — the farm already made this and the user is not happy with it.\n"
+        "REDO request — the farm already made this and Eric is not happy with it.\n"
         f"WHAT WAS MADE ({made}):\n"
         f"PROMPT: {str(job.get('prompt', ''))[:900]}\n"
         + (f"REFERENCE IMAGE: {os.path.basename(str(job.get('image_path')))}\n"
            if job.get("image_path") else "")
-        + f"\nWHAT THE USER WANTS DIFFERENT: {str(note)[:1200]}\n"
+        + f"\nWHAT ERIC WANTS DIFFERENT: {str(note)[:1200]}\n"
         "\nChange only what he complained about, keep everything he didn't, and do not "
         "repeat the take described above. Reply to him in one or two sentences saying "
         "what you understood, then give the corrected shot(s)."
@@ -1847,7 +2528,7 @@ def _builder_plan_handler(data):
     history = _thread_history(tid) if tid else (data.get("history") or [])
     if data.get("redo_of"):
         message = _redo_context(data.get("redo_of"), message)
-    plan = _builder_plan(message, history)
+    plan = _builder_plan(message, history, data.get("site"))
     if tid:
         _append_turn(tid, "user", message)
         _append_turn(tid, "assistant", _plan_digest(plan),
@@ -1909,7 +2590,7 @@ def _director_note(goal, job, next_job, clip_path):
         return None
 
 
-PREP_PY = os.environ.get("SNORA_PREP_PY", "python3")  # needs Pillow installed
+PREP_PY = "/Users/snailmac/mlx-env/bin/python3"
 PREP_SCRIPT = '''
 import sys
 from PIL import Image, ImageOps
@@ -2013,6 +2694,9 @@ def main():
     # post lane must start first thing after renderer — it drains finished clips
     # to R2 and flips jobs to done; missing it leaves every render stuck in "rendering"
     threading.Thread(target=_post_loop, daemon=True).start()
+    # the chron lane: enqueues scheduled jobs (no priority) and delivers finished
+    # ones to Discord. Safe to start before the renderer — it only writes queue rows.
+    threading.Thread(target=_sched_loop, daemon=True).start()
     if CONFIG["backend"] == "vpipe":
         threading.Thread(target=_recover_orphans, daemon=True).start()
         slots = max(1, int(CONFIG.get("render_slots", 2)))

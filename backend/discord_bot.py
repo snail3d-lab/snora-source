@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""sNora Discord bot — @sNora <idea> in your Discord server → render farm → media back in chat.
+"""sNora Discord bot — @sNora <idea> in the Snail Discord → render farm → clip back in chat.
 
-Runs beside the render service
-(sora_service.py on :7789, launched by your service manager).
+Runs on the MacBook under launchd next to the sNora render service
+(sora_service.py on :7789, launched by com.snail3d.sora).
 
 Flow for a visitor's "@sNora make a clip of ..." message:
   1. bot acks with "🎬 On it…"
@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -32,6 +33,10 @@ import discord
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
 WATCH_FILE = os.path.join(HERE, "discord_watch.json")
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)          # h3_prompt.py sits beside this file
+from h3_prompt import (FIRE_RULE, CONTRACT, wants_fire, fire_slip,              # noqa: E402
+                       fire_slip_in, fire_corrective, negative_for, clean_body)
 
 DEFAULTS = {
     "service_url": "http://127.0.0.1:7789",
@@ -40,16 +45,27 @@ DEFAULTS = {
     "allowed_channel_ids": [],    # empty = every channel in an allowed server
     "max_active_per_user": 1,     # bot-side guard (farm has its own too)
     "min_gap_secs": 15,           # one ask per user per this window
+    "busy_status": True,          # DND "rendering — busy" presence while any job is live
+    "ignore_replies": True,       # a bare reply is not an ask — a typed @ping in a reply is
+    "reply_owner_exempt": True,   # ...but the operator may still reply to trigger a run
+    "ask_role_ids": [],           # role IDs whose ping also counts as an ask (the server sNora role)
+    "max_active_total": 0,        # global in-flight cap (0 = unlimited); busy-reply at the cap
     "poll_secs": 20,              # queue poll cadence
     "max_wait_secs": 3 * 3600,    # give up watching after 3h
-    "await_approval": False,      # True = hold Discord jobs at the owner's gate
+    "await_approval": False,      # True = hold Discord jobs at Eric's gate
     "nanny": True,                # hard PG gate on asks before anything runs
     "nanny_off_guilds": [],       # server IDs with the PG gate OFF (private adult channels)
     "nanny_extra_banned": [],     # extra hard-banned words/phrases (server-side, case-insensitive)
+    # Qwen STILLS take a real negative prompt (CFG > 1); H3 video cannot, it is
+    # CFG-distilled — see h3_prompt.py. Turn this on to spend a second DiT pass
+    # per still keeping fire out when nobody asked for it.
+    "fire_negative_stills": False,
+    "fire_negative_prompt": "",
+    "fire_negative_cfg": 3.0,
     "owner_ids": [],              # user IDs (the operator + helpers): no nanny, no spam guards
     "snora_token": "",            # R2 fallback fetch (X-Sora-Token)
-    "studio_url": "http://127.0.0.1:7778",  # SnailStudio AI-engine host (Qwen stills)
-    "searx_url": "",             # your SearXNG JSON endpoint, e.g. http://127.0.0.1:8889/search
+    "studio_url": "http://100.120.41.45:7778",  # SnailStudio AI-engine host (Qwen stills) — now blacksnail3 (DGX Spark)
+    "searx_url": "http://100.97.237.37:8889/search",  # fleet SearXNG (blacksnail1)
 }
 
 DURATIONS = {3, 4, 5, 8, 10, 15}
@@ -116,6 +132,16 @@ BLASPHEMY_RE = re.compile(
     r"(?:hail|worship|praise) (?:the )?(?:devil|satan)|taking the lord'?s name in vain)\b",
     re.I)
 
+# A member DISCLAIMING ("not sexual", "no nudity", "nothing explicit") is not asking
+# for it. Strip those phrases before the hard sexual gate reads the ask, so a clean
+# idea that says "not sexual" in passing is not refused on its own disclaimer.
+_SEX_DISCLAIMER_RE = re.compile(
+    r"\b(?:not|no|never|nothing|none|non|without|isn'?t|aren'?t|ain'?t|zero|free of|absent)"
+    r"\s*[- ]?\s*(?:really\s+|at all\s+|very\s+|too\s+)?"
+    r"(?:sexual\w*|sexy|sex|nudity|nudes|nude|naked|porn\w*|erotic\w*|explicit|suggestive|"
+    r"nsfw|smut\w*|fetish\w*)"
+    r"(?:\s+(?:at all|whatsoever))?\b", re.I)
+
 
 def _is_owner(user_id):
     """Operator allowlist: runs the open lane everywhere and skips bot-side guards."""
@@ -144,7 +170,7 @@ def nanny_check(text, guild_id=None, user_id=None):
             return (f"‘{w}’ is banned here", True)
     if BLASPHEMY_RE.search(text):
         return ("not here — no blasphemy", True)
-    if NANNY_RE.search(text):
+    if NANNY_RE.search(_SEX_DISCLAIMER_RE.sub(" ", text)):
         if MINOR_RE.search(text):
             return ("I don't mix kids and adult content", True)
         return ("no porn or sexual content here — hard rule", True)
@@ -176,9 +202,9 @@ CFG = load_cfg()
 
 
 def _load_library():
-    """The Discord-safe slice of the studio reference manifest: only the mascot
-    characters and the bare sets. The operator's own photos, poses, attire and
-    likenesses are deliberately invisible to Discord members."""
+    """The Discord-safe slice of Eric's reference manifest: only the snail
+    characters and the bare sets. Eric himself (photos, poses, attire, likenesses)
+    is deliberately invisible to Discord members."""
     keep = ["baby_snail_canonical", "baby_snail_sheet", "shack_wide",
             "shack_computer_corner", "prop_bambu_p2s", "ref_shack_day"]
     scrub = {
@@ -199,7 +225,7 @@ def _load_library():
     for k in keep:
         if k not in by_key:
             continue
-        desc = scrub.get(k, re.sub(r"the host'?s? ?", "the snail ", by_key[k].get("desc", "")))
+        desc = scrub.get(k, re.sub(r"Eric'?s? ?", "the snail ", by_key[k].get("desc", "")))
         out.append({"key": k, "desc": desc})
     return out
 
@@ -218,7 +244,6 @@ def _req(url, payload=None, headers=None, method=None, timeout=20):
                                  headers={"Content-Type": "application/json", **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.status, json.loads(resp.read().decode())
-
 
 # ── planner token budget (MEASURED 2026-10-02) ──────────────────────────
 # snail-top's thinking lane bills its chain-of-thought to max_tokens. With the
@@ -268,6 +293,7 @@ def explicit_duration(text):
     m = re.search(r"\b(three|four|five|eight|ten|fifteen)\b", text or "", re.I)
     return ({"three": 3, "four": 4, "five": 5, "eight": 8, "ten": 10, "fifteen": 15}
             .get(m.group(1).lower()) if m else None)
+
 
 
 def farm_headers(user_id=None):
@@ -330,6 +356,30 @@ async def collect_images(attachments):
     return imgs, skipped
 
 
+# ── the chron lane (owner-only) ─────────────────────────────────────────
+# Schedules are created and controlled from chat, but ONLY by the operator, and
+# quiet hours are enforced by the farm — /chron never bypasses them.
+
+def sched_get(path):
+    return _req(CFG["service_url"] + path, headers=farm_headers(), timeout=25)[1]
+
+
+def sched_post(path, payload=None):
+    req = urllib.request.Request(
+        CFG["service_url"] + path,
+        data=json.dumps(payload).encode() if payload is not None else b"{}",
+        method="POST",
+        headers={"Content-Type": "application/json", **farm_headers()})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode())
+        except Exception:
+            return e.code, {"error": str(e)}
+
+
 def _qwen_size_for(data_url, target=1536):
     """Canvas for a Qwen edit: follow the attached picture's own aspect at
     ~1536 on the long side, snapped to /32 (the engine's requirement)."""
@@ -354,7 +404,7 @@ def _qwen_size_for(data_url, target=1536):
 
 SYSTEM = (
     "You are sNora, the video-generation bot in this Discord community. A member gives you a "
-    "video idea; you turn it into ONE complete scene prompt for the MiniMax H3 render farm "
+    "video idea; you turn it into ONE complete scene prompt for Eric's MiniMax H3 render farm "
     "and a short friendly reply. You cannot render anything you haven't planned.\n\n"
     "THE HANDBOOK (condensed):\n"
     "- ONE shot per clip. Stage depth (foreground/midground/background) instead of cutting.\n"
@@ -424,6 +474,10 @@ SYSTEM = (
     "  * Language is PG-13: 'damn', 'hell', 'crap', 'ass', 'bullshit' are fine in dialogue; "
     "f-words, c-words and every slur are not. The farm does not make the mouth move, but the "
     "line is still heard — keep it clean.\n"
+    "  * Toilet humour is fine — farts, burps, hiccups, a whoopee cushion, a pratfall. A "
+    "bodily-function gag is cartoon slapstick, not a degrading act: never refuse it, "
+    "including when a real named performer or public figure is the one doing it. Keep it "
+    "non-sexual, and let the rude sound live in the soundscape, not in dialogue.\n"
     "  * No blasphemy: never mock, demean, or 'roast' a religion, deity, prophet, scripture, "
     "or act of worship, and never stage a religious figure in a comedic or degrading bit. "
     "Religious settings, holidays, architecture, music and culture as neutral or warm "
@@ -435,6 +489,10 @@ SYSTEM = (
     '{"reply": "<1-2 friendly sentences to the member>", "prompt": "<the complete scene>", '
     '"duration": 3, "aspect": "<auto if a picture is in play and no shape was named, else wide>", '
     '"quality": "standard", "ref_mode": "scene", '
+    '"soundscape": "<1-4 sentences of ambient + physical sound for the whole clip: wind, rain, '
+    'footsteps, cloth, machines. Never repeat the dialogue>", '
+    '"music": "<1-3 sentences of score — instrumentation, tempo, rhythm, dynamics — or N/A if '
+    'there is no score>", '
     '"image": "<library key or null>", "reject_reason": null}'
 )
 
@@ -453,6 +511,8 @@ SAFETY_OPEN = (
     "  * Satire of real people is allowed, but never phrase it as a fact about them — no "
     "staged confessions, crimes, arrests, or mock-documentary presented as real. Obviously "
     "cartoonish = fine.\n"
+    "  * Crude bodily-function comedy — farts, burps, pratfalls — is obviously cartoonish, "
+    "never a claim staged to look true: write it, including about a real named performer.\n"
     "  * Everything else is on the table: strong language, sexual and erotic themes, "
     "violence and gore, religious or blasphemous material, dark comedy, and any fictional "
     "character, franchise, or brand by its real name (Sonic, Mario, Godzilla, whoever). "
@@ -467,12 +527,14 @@ SAFETY_OPEN = (
 
 
 def system_for(open_lane):
-    """PG prompt by default; open-lane prompt swaps the SAFETY block wholesale."""
+    """PG prompt by default; open-lane prompt swaps the SAFETY block wholesale.
+    FIRE_RULE + CONTRACT ride on top: fire is opt-in, and the second half is the
+    official MiniMax H3 writing contract this model was trained on."""
     if not open_lane:
-        return SYSTEM
+        return SYSTEM + FIRE_RULE + CONTRACT
     a = SYSTEM.index("- SAFETY (hard rules of this server):")
     b = SYSTEM.index("OUTPUT — strict JSON only")
-    return SYSTEM[:a] + SAFETY_OPEN + SYSTEM[b:]
+    return SYSTEM[:a] + SAFETY_OPEN + SYSTEM[b:] + FIRE_RULE + CONTRACT
 
 
 # ── still-image formatter (Qwen-Image-2.1 prompting contract) ────────────
@@ -526,6 +588,9 @@ STILL_SYSTEM = (
     "mock documentary).\n"
     "  * No slurs; no cruelty aimed at private individuals; nothing sexualising anyone depicted "
     "as a minor (instant, absolute).\n"
+    "  * Toilet humour is fine — farts, burps, a whoopee cushion, a pratfall. A bodily-"
+    "function gag is cartoon slapstick, not a degrading act: never refuse it, including "
+    "when a real named performer or public figure is the one doing it. Keep it non-sexual.\n"
     "  * PG-13 language; no blasphemy. Refusing is one calm line in reject_reason.\n\n"
     "OUTPUT — strict JSON only, no markdown fences:\n"
     '{"reply": "<1-2 friendly sentences>", "prompt": "<the finished-frame description>", '
@@ -537,10 +602,10 @@ STILL_SYSTEM = (
 def still_system_for(open_lane):
     """PG still prompt by default; the private/open lane swaps the SAFETY block."""
     if not open_lane:
-        return STILL_SYSTEM
+        return STILL_SYSTEM + FIRE_RULE
     a = STILL_SYSTEM.index("- SAFETY (hard rules of this server):")
     b = STILL_SYSTEM.index("OUTPUT — strict JSON only")
-    return STILL_SYSTEM[:a] + SAFETY_OPEN + STILL_SYSTEM[b:]
+    return STILL_SYSTEM[:a] + SAFETY_OPEN + STILL_SYSTEM[b:] + FIRE_RULE
 
 
 # ── image screening rides on the director turn (snail-top vision) ───────
@@ -593,6 +658,17 @@ def craft_still(ask, has_photo, guild_id=None, user_id=None, images=None):
                     continue
         if not isinstance(plan, dict):
             plan = {}
+        _sbody, _sinline = clean_body(str(plan.get("prompt") or ""))
+        slip = [] if wants_fire(ask) else fire_slip_in(
+            _sbody, _sinline.get("overall_soundscape", ""), _sinline.get("non_diegetic_music", ""))
+        if slip and attempt_n == 1:
+            log.warning("still planner invented fire (%s) for a no-fire ask — re-asking: %s",
+                        ", ".join(slip), ask[:70])
+            corrective = fire_corrective(slip, str(plan.get("prompt") or "")[:1500])
+            continue
+        if slip:
+            log.warning("still: fire survived the re-ask (%s) — shipping: %s",
+                        ", ".join(slip), ask[:70])
         if (plan.get("reject_reason") and lane_open and attempt_n == 1 and not images
                 and not MINOR_HOT_RE.search(ask) and not MINOR_RE.search(ask)):
             log.warning("craft_still refused an open-lane ask (%s) — retrying once", ask[:80])
@@ -659,6 +735,19 @@ def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None, facts=""
                     continue
         if not isinstance(plan, dict):
             plan = {}
+        # Fire is opt-in, and H3 is CFG-distilled so there is no negative prompt to
+        # lean on (h3_prompt.py). One re-ask, with the draft quoted back.
+        _body, _inline = clean_body(str(plan.get("prompt") or ""))
+        slip = [] if wants_fire(ask) else fire_slip_in(
+            _body, _inline.get("overall_soundscape", ""), _inline.get("non_diegetic_music", ""))
+        if slip and attempt_n == 1:
+            log.warning("planner invented fire (%s) for a no-fire ask — re-asking: %s",
+                        ", ".join(slip), ask[:70])
+            corrective = fire_corrective(slip, str(plan.get("prompt") or "")[:1500])
+            continue
+        if slip:
+            log.warning("fire survived the re-ask (%s) — shipping anyway: %s",
+                        ", ".join(slip), ask[:70])
         if (plan.get("reject_reason") and lane_open and attempt_n == 1 and not images
                 and not MINOR_HOT_RE.search(ask) and not MINOR_RE.search(ask)):
             log.warning("craft refused an open-lane ask (%s) — retrying once: %s",
@@ -667,7 +756,12 @@ def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None, facts=""
         break
     if plan.get("reject_reason"):
         return {"reject": str(plan["reject_reason"])[:300], "reply": str(plan.get("reply", ""))[:300]}
-    prompt = str(plan.get("prompt") or "").strip()
+    # the scaffold owns the field labels — lift any the planner inlined, and keep
+    # its own soundscape/music if it wrote them as separate keys
+    prompt, inline = clean_body(str(plan.get("prompt") or ""))
+    prompt = prompt.strip()
+    plan["soundscape"] = plan.get("soundscape") or inline.get("overall_soundscape") or ""
+    plan["music"] = plan.get("music") or inline.get("non_diegetic_music") or ""
     if not prompt:
         # The planner's JSON never landed (empty content, or content the parser
         # could not unwrap). Ship the member's own words — but NEVER silently:
@@ -696,21 +790,23 @@ def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None, facts=""
         # duration would be coerced back to 5s at the farm and rejected again
         nxt = max([d for d in grid if d > duration], default=15)
         duration = max(want, nxt) if want and want > duration else nxt
-    # Last gate: the farm 400s an over-budget line at the door, which reads to the
-    # member as "no video". If even 15s cannot hold it, say so in plain words
-    # instead of queueing a job that is guaranteed to bounce.
-    if spoken_words(prompt) > max(4, round(duration * 2.2)):
-        return {"error": f"That line is {spoken_words(prompt)} words — 15s (the longest "
-                         "clip) fits about 33 spoken words. Shorten the line and send it again."}
     img_key = plan.get("image") if plan.get("image") in LIB_KEYS else None
     aspect = (plan.get("aspect") if plan.get("aspect") in ASPECTS or
               plan.get("aspect") == "auto" else DEFAULT_ASPECT)
     # deterministic: any picture in play + no shape named by the member = match the picture
     if (img_key or has_photo) and aspect != "auto" and not SHAPE_WORDS.search(ask):
         aspect = "auto"
+    # Last gate: the farm 400s an over-budget line at the door, which reads to the
+    # member as "no video". If even 15s cannot hold it, say so in plain words
+    # instead of queueing a job that is guaranteed to bounce.
+    if spoken_words(prompt) > max(4, round(duration * 2.2)):
+        return {"error": f"That line is {spoken_words(prompt)} words — 15s (the longest "
+                         "clip) fits about 33 spoken words. Shorten the line and send it again."}
     return {
         "reply": str(plan.get("reply") or "On it!")[:300],
         "prompt": prompt[:2000],
+        "soundscape": str(plan.get("soundscape") or "")[:600],
+        "music": str(plan.get("music") or "")[:300],
         "duration": duration,
         "aspect": aspect,
         "quality": plan.get("quality") if plan.get("quality") in QUALITIES else DEFAULT_QUALITY,
@@ -760,7 +856,7 @@ def share_link(jid, kind="video"):
         return None
 
 
-# ── web research (SearXNG JSON API) ─────────────────────────────────────
+# ── web research (SearXNG on the fleet: blacksnail1 :8889) ──────────────
 
 LOOKUP_RE = re.compile(
     r"\b(look ?up|search(?: the web| the internet| for)?|google|research|"
@@ -776,10 +872,8 @@ RENDER_RE = re.compile(
 
 
 def searx_search(query, limit=6):
-    """SearXNG JSON API -> [{'title','url','snippet'}, ...].
-    Blocking — always call via asyncio.to_thread. No searx_url = feature off."""
-    if not CFG.get("searx_url"):
-        return []
+    """SearXNG (fleet: blacksnail1:8889) -> [{'title','url','snippet'}, ...].
+    Blocking — always call via asyncio.to_thread."""
     url = CFG["searx_url"] + "?" + urllib.parse.urlencode({"q": query[:400], "format": "json"})
     try:
         req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA,
@@ -891,8 +985,77 @@ class SnoraClient(discord.Client):
         self.tree = discord.app_commands.CommandTree(self)
         self.active = {}     # user_id -> int (bot-side concurrency guard)
         self.last_ask = {}   # user_id -> ts (spam guard)
+        # busy presence (see _apply_presence): DND while anything is live
+        self._presence_gen = 0
+        self._presence_worker = None
+        self._last_presence_at = 0.0
 
     # ---- helpers ----
+
+    @property
+    def inflight(self):
+        """Clips/stills this bot currently has queued or rendering."""
+        return sum(self.active.values())
+
+    def _job_start(self, user_id):
+        self.active[user_id] = self.active.get(user_id, 0) + 1
+        self._schedule_presence()
+
+    def _job_end(self, user_id):
+        if user_id is None:
+            return
+        left = self.active.get(user_id, 1) - 1
+        if left > 0:
+            self.active[user_id] = left
+        else:
+            self.active.pop(user_id, None)
+        self._schedule_presence()
+
+    def _schedule_presence(self):
+        """Debounced presence refresh — coalesces the +1/-1 bursts and stays
+        well under Discord's 5-updates-per-minute gateway limit."""
+        self._presence_gen += 1
+        if not CFG.get("busy_status", True):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._presence_worker is None or self._presence_worker.done():
+            self._presence_worker = loop.create_task(self._presence_loop())
+
+    async def _presence_loop(self):
+        while True:
+            gen = self._presence_gen
+            await asyncio.sleep(1.5)
+            if gen != self._presence_gen:
+                continue                     # state moved — re-read and re-apply
+            wait = 5 - (time.time() - self._last_presence_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+                if gen != self._presence_gen:
+                    continue
+            await self._apply_presence()
+            self._last_presence_at = time.time()
+            if gen == self._presence_gen:
+                return
+
+    async def _apply_presence(self):
+        """Idle: online, watching the queue. Busy: DND, 'rendering — busy'."""
+        try:
+            n = self.inflight
+            if n:
+                act = discord.Activity(
+                    type=discord.ActivityType.playing,
+                    name=f"rendering — busy ({n} in the pipeline)")
+                await self.change_presence(status=discord.Status.dnd, activity=act)
+            else:
+                act = discord.Activity(
+                    type=discord.ActivityType.watching, name="the render queue")
+                await self.change_presence(status=discord.Status.online, activity=act)
+        except Exception:
+            # presence is cosmetic — a gateway hiccup must never kill the bot
+            log.debug("presence update skipped", exc_info=True)
 
     def allowed(self, ch):
         if isinstance(ch, discord.TextChannel):
@@ -1025,7 +1188,8 @@ class SnoraClient(discord.Client):
                          text, re.I) and len(imgs) >= 2:
                 end_image = imgs.pop()
         # 2. queue it on the farm
-        payload = {k: plan[k] for k in ("prompt", "quality", "aspect", "duration", "ref_mode")}
+        payload = {k: plan[k] for k in ("prompt", "quality", "aspect", "duration", "ref_mode",
+                                        "soundscape", "music")}
         payload["await_approval"] = bool(CFG["await_approval"])
         payload["source"] = f"discord:{user.name}"[:60]
         if plan.get("image") and not imgs:
@@ -1047,7 +1211,7 @@ class SnoraClient(discord.Client):
         if code != 201:
             return await ack.edit(content=f"🚫 {res.get('error', 'the farm said no')}")
         job = res
-        self.active[user.id] = self.active.get(user.id, 0) + 1
+        self._job_start(user.id)
         w = _load_watch()
         ask_mid = getattr(getattr(ack, "reference", None), "message_id", None)
         w[job["id"]] = {"channel": int(ch.id), "message": int(ack.id), "user": int(user.id),
@@ -1096,6 +1260,15 @@ class SnoraClient(discord.Client):
             "seed": -1,
             "use_kv_cache": True,
         }
+        # Qwen has real CFG, so a negative prompt actually bites — but only with
+        # true_cfg_scale > 1 (the route's default 1.0 disables CFG entirely).
+        neg, neg_cfg = negative_for(text,
+                                    enabled=bool(CFG.get("fire_negative_stills")),
+                                    negative=CFG.get("fire_negative_prompt"),
+                                    cfg=CFG.get("fire_negative_cfg") or 3.0)
+        if neg:
+            payload["negative_prompt"] = neg
+            payload["true_cfg_scale"] = neg_cfg
         if imgs:
             payload["images"] = imgs[:10]
             w, h = _qwen_size_for(imgs[0])
@@ -1105,7 +1278,7 @@ class SnoraClient(discord.Client):
             payload["aspect"] = plan["aspect"]
             size_line = plan["aspect"]
 
-        self.active[user.id] = self.active.get(user.id, 0) + 1
+        self._job_start(user.id)
         note = ("\n⚠️ skipped unsupported picture(s): " + ", ".join(skipped[:3])) if skipped else ""
         kind = "🎨 **Editing your picture**" if imgs else "🎨 **Painting**"
         await self.safe_edit(
@@ -1137,7 +1310,7 @@ class SnoraClient(discord.Client):
             log.exception("still submit failed")
             code, res = 0, {"error": "unreachable"}
         finally:
-            self.active[user.id] = max(0, self.active.get(user.id, 1) - 1)
+            self._job_end(getattr(user, "id", None))
         if code != 200 or not res.get("ok"):
             err = str(res.get("error") or f"HTTP {code}")[:220]
             if "GPU busy" in err:
@@ -1244,7 +1417,7 @@ class SnoraClient(discord.Client):
                     break
             else:
                 await self.safe_edit(ack, self._with_ask(
-                    "⌛ This one's been parked longer than expected — ping the operator if it doesn't land.",
+                    "⌛ This one's been parked longer than expected — ping Eric if it doesn't land.",
                     ask))
         finally:
             # record completion FIRST — a crash after delivery must never make
@@ -1256,8 +1429,7 @@ class SnoraClient(discord.Client):
                 if time.time() - started > 86400:
                     del w[jid]
                 _save_watch(w)
-            if user is not None:
-                self.active[user.id] = max(0, self.active.get(user.id, 1) - 1)
+            self._job_end(getattr(user, "id", None))
 
     async def deliver(self, jid, plan, ch, ack, user, started, ask=None, reply_to=None):
         mins = max(1, round((time.time() - started) / 60))
@@ -1316,7 +1488,7 @@ class SnoraClient(discord.Client):
         return False
 
     async def handle_research(self, ch, user, text, ack):
-        """Pure web-research answer — SearXNG + LLM summary, no render."""
+        """Pure web-research answer — SearXNG + snail-top summary, no render."""
         q = re.sub(r"(?i)^\s*(please\s+)?(look ?up|search(?: the web| the internet| for)?|"
                    r"google|research|find out(?: about)?|tell me about)\s*", "", text).strip(" ?.")
         q = q or text
@@ -1349,6 +1521,9 @@ class SnoraClient(discord.Client):
             await self.tree.sync()
         except discord.DiscordException:
             log.warning("slash command sync failed (needs applications.commands scope)")
+        # go quiet-online now; resumes below will flip us to busy/DND if needed
+        await self._apply_presence()
+        self._last_presence_at = time.time()
         # resume watching jobs that were in flight when we last exited
         for jid, e in list(_load_watch().items()):
             if e.get("done_notified"):
@@ -1361,20 +1536,49 @@ class SnoraClient(discord.Client):
                 continue
             plan = {"duration": 5, "aspect": DEFAULT_ASPECT, "quality": DEFAULT_QUALITY,
                     "prompt": e.get("ask", "")}
+            member = user or ch.guild.get_member(e["user"])
+            if member is not None:
+                self._job_start(member.id)
             log.info("resuming watch of %s", jid)
             asyncio.create_task(self.watch_job(jid, plan, ch, ack,
-                                               user or ch.guild.get_member(e["user"]), _load_watch()))
+                                               member, _load_watch()))
 
     async def on_message(self, message):
         if message.author.bot or message.guild is None:
             return
-        mentioned = self.user in message.mentions
+        # A bare reply is not an ask: Discord adds the replied-to author to
+        # `message.mentions` (that's the reply ping), so a throwaway "lmao"
+        # reply to a finished clip used to kick off a whole new render. The
+        # tell is what the member actually *typed* — an @sNora typed into a
+        # reply is a real ask, the automatic reply-ping is not. The operator
+        # may reply either way.
+        ask_roles = {str(r) for r in (CFG.get("ask_role_ids") or [])}
+        typed = set(re.findall(r"<@[!&]?(\d+)>", message.content or ""))
+        typed_ping = bool(typed & (ask_roles | {str(self.user.id)}))
+        if (message.reference is not None and CFG.get("ignore_replies", True)
+                and not typed_ping
+                and not (CFG.get("reply_owner_exempt", True)
+                         and _is_owner(message.author.id))):
+            log.info("ignoring reply from %s in #%s (not an ask — no typed ping)",
+                     message.author, getattr(message.channel, "name", "?"))
+            return
+        # A ping of the server's sNora *role* counts too: members reach for
+        # the role chip in the @ picker far more often than the bot account,
+        # and a role ping never lands in `message.mentions`. Real pings stay
+        # authoritative — a bot id pasted inside a code block pings nobody.
+        pings = {str(r) for r in getattr(message, "mention_roles", []) or []}
+        user_ping = self.user in message.mentions
+        mentioned = user_ping or bool(ask_roles & pings)
         if not mentioned:
             return
+        if not user_ping:
+            log.info("role ping from %s in #%s (role %s) treated as an ask",
+                     message.author, getattr(message.channel, "name", "?"),
+                     ",".join(sorted(ask_roles & pings)))
         ch = message.channel
         if not self.allowed(ch):
             return
-        text = re.sub(r"<@!?\d+>", "", message.content).strip()
+        text = re.sub(r"<@[!&]?\d+>", "", message.content).strip()
         imgs = tuple(a for a in message.attachments)
         if mentioned and not text and not imgs:
             await message.reply("Say what you'd like to see — e.g. "
@@ -1406,8 +1610,18 @@ class SnoraClient(discord.Client):
                                 mention_author=False)
             return
         if self.active.get(message.author.id, 0) >= CFG["max_active_per_user"]:
-            await message.reply("You already have a render in the pipeline — I'll post it here "
-                                "when it's done.", mention_author=False)
+            extra = self.inflight - self.active.get(message.author.id, 0)
+            also = (f" (plus {extra} other clip{'s' if extra != 1 else ''} in the pipeline)"
+                    if extra > 0 else "")
+            await message.reply(
+                f"⏳ I'm in use on your last render{also} — it's still in the pipeline. "
+                "I'll post it here when it's done.", mention_author=False)
+            return
+        cap = int(CFG.get("max_active_total") or 0)
+        if cap and not _is_owner(message.author.id) and self.inflight >= cap:
+            await message.reply(
+                f"⏳ I'm in use right now — {self.inflight} clips already in the pipeline. "
+                "Give me a few minutes and mention me again.", mention_author=False)
             return
         self.last_ask[message.author.id] = time.time()
         log.info("ask from %s in #%s still=%s: %s", message.author, getattr(ch, "name", "?"),
@@ -1437,8 +1651,8 @@ class SnoraClient(discord.Client):
                 return
             if (not _is_owner(interaction.user.id)
                     and self.active.get(interaction.user.id, 0) >= CFG["max_active_per_user"]):
-                await interaction.response.send_message("You already have a clip in the pipeline.",
-                                                        ephemeral=True)
+                await interaction.response.send_message("⏳ I'm in use — you already have a clip in "
+                                                        "the pipeline.", ephemeral=True)
                 return
             atts = [a for a in (photo,) if a is not None]
             end_image = None
@@ -1465,6 +1679,105 @@ class SnoraClient(discord.Client):
             ack = await interaction.original_response()
             await self.handle_ask(interaction.channel, interaction.user, idea, ack,
                                   atts, end_image)
+
+        # ── /chron — the operator's schedule control (owner only) ───────
+        @self.tree.command(name="chron",
+                           description="Schedules (owner only) — list, add, run, pause, remove")
+        @discord.app_commands.describe(
+            action="What to do",
+            name="A name for the new schedule (with add)",
+            interval="Hours between runs (with add)",
+            quiet_start="Hour the quiet window starts, 0-23 (with add)",
+            quiet_end="Hour the quiet window ends, 0-23 (with add)",
+            channel="Discord channel id to deliver into (with add; omit to skip Discord)",
+            app="Also deliver into the sNora app (with add)",
+            schedule_id="Which schedule (with run/pause/on/remove)")
+        @discord.app_commands.choices(action=[
+            discord.app_commands.Choice(name="list", value="list"),
+            discord.app_commands.Choice(name="add", value="add"),
+            discord.app_commands.Choice(name="run now", value="run"),
+            discord.app_commands.Choice(name="pause", value="pause"),
+            discord.app_commands.Choice(name="resume", value="on"),
+            discord.app_commands.Choice(name="remove", value="remove"),
+        ])
+        async def _chron(interaction: discord.Interaction,
+                         action: discord.app_commands.Choice[str],
+                         name: str = None, interval: int = 2,
+                         quiet_start: int = 0, quiet_end: int = 8,
+                         channel: str = None, app: bool = False,
+                         schedule_id: str = None):
+            # OWNER ONLY — this is the operator's control surface
+            if not _is_owner(interaction.user.id):
+                return await interaction.response.send_message(
+                    "That one's the operator's.", ephemeral=True)
+            act = action.value
+            if act == "list":
+                try:
+                    data = await asyncio.to_thread(sched_get, "/schedule")
+                except Exception as e:
+                    return await interaction.response.send_message(
+                        f"⚠️ Couldn't reach the farm schedule list ({e.__class__.__name__}).",
+                        ephemeral=True)
+                rows = data.get("describe") or {}
+                if not rows:
+                    return await interaction.response.send_message(
+                        "No schedules yet. `/chron add name:Singing Dogs channel:<id>`",
+                        ephemeral=True)
+                lines = [f"• `{sid}` — {txt}" for sid, txt in rows.items()]
+                return await interaction.response.send_message(
+                    "**Schedules**\n" + "\n".join(lines)[:1900], ephemeral=True)
+            if act == "add":
+                if not name:
+                    return await interaction.response.send_message(
+                        "A new schedule needs a `name`.", ephemeral=True)
+                targets = []
+                if channel:
+                    targets.append({"kind": "discord", "guild_id": str(interaction.guild_id or ""),
+                                    "guild_name": getattr(interaction.guild, "name", ""),
+                                    "channel_id": str(channel), "channel_name": ""})
+                if app:
+                    targets.append({"kind": "app"})
+                if not targets:
+                    return await interaction.response.send_message(
+                        "Pick at least one delivery target: `channel:<id>`, `app:True`, or both.",
+                        ephemeral=True)
+                body = {"name": name, "kind": "singing_dog", "interval_hours": interval,
+                        "quiet_start": quiet_start, "quiet_end": quiet_end,
+                        "duration": 8, "quality": "standard", "aspect": "vertical",
+                        "tz": "America/Denver", "targets": targets}
+                try:
+                    code, res = await asyncio.to_thread(sched_post, "/schedule", body)
+                except Exception as e:
+                    return await interaction.response.send_message(
+                        f"⚠️ The farm didn't answer ({e.__class__.__name__}).", ephemeral=True)
+                if code >= 400:
+                    return await interaction.response.send_message(
+                        f"🚫 {res.get('error', 'refused')}", ephemeral=True)
+                return await interaction.response.send_message(
+                    f"✅ {res.get('describe', 'created')}", ephemeral=True)
+            if not schedule_id:
+                return await interaction.response.send_message(
+                    "That needs `schedule_id` — run `/chron list` first.", ephemeral=True)
+            path = (f"/schedule/{schedule_id}/"
+                    + {"run": "run", "pause": "toggle", "on": "toggle",
+                       "remove": "delete"}[act])
+            try:
+                code, res = await asyncio.to_thread(sched_post, path, {})
+            except Exception as e:
+                return await interaction.response.send_message(
+                    f"⚠️ The farm didn't answer ({e.__class__.__name__}).", ephemeral=True)
+            if code >= 400:
+                return await interaction.response.send_message(
+                    f"🚫 {res.get('error', 'refused')}", ephemeral=True)
+            if act == "remove":
+                return await interaction.response.send_message("🗑️ removed.", ephemeral=True)
+            if act == "run":
+                return await interaction.response.send_message(
+                    f"🎬 queued `{res.get('job_id')}` — it renders in turn, no priority.",
+                    ephemeral=True)
+            txt = res.get("describe") or ""
+            return await interaction.response.send_message(f"✅ {txt}", ephemeral=True)
+
 
         @self.tree.command(name="research",
                            description="Look something up on the web (answer only, no render)")
@@ -1500,8 +1813,8 @@ class SnoraClient(discord.Client):
                 return
             if (not _is_owner(interaction.user.id)
                     and self.active.get(interaction.user.id, 0) >= CFG["max_active_per_user"]):
-                await interaction.response.send_message("You already have a render in the pipeline.",
-                                                        ephemeral=True)
+                await interaction.response.send_message("⏳ I'm in use — you already have a render in "
+                                                        "the pipeline.", ephemeral=True)
                 return
             atts = [a for a in (photo,) if a is not None]
             hints = []

@@ -41,7 +41,7 @@ struct Job: Identifiable, Codable {
     var url: String?
 
     var videoURL: URL? {
-        url.flatMap { URL(string: "https://YOUR-BACKEND.example.com\($0)") }
+        url.flatMap { URL(string: "https://snail3d.com\($0)") }
     }
 
     var isDone: Bool {
@@ -121,11 +121,11 @@ struct RefList: Codable {
 }
 
 enum API {
-    static let base = "https://YOUR-BACKEND.example.com/api/sora"
+    static let base = "https://snail3d.com/api/sora"
 
     /// baked farm token — the single source of truth.
     /// never read from UserDefaults: a stale unlock-era token used to silently override it.
-    static let token = "REPLACE_WITH_YOUR_SNORA_TOKEN"
+    static let token = "648c2e4ed98467721cdd28b36579897985e0a3f0a6e60993905cd23218373761"
 
     static func unlock(_ pw: String) async throws -> String {
         var req = URLRequest(url: URL(string: "\(base)/unlock")!)
@@ -147,6 +147,62 @@ enum API {
         return (raw["jobs"] ?? []).sorted { ($0.created ?? 0) > ($1.created ?? 0) }
     }
 
+    // ── the chron lane ──────────────────────────────────────────────────
+    /// Every schedule the farm holds, newest first.
+    static func schedules(token: String) async throws -> (schedules: [Schedule], describe: [String: String]) {
+        var req = URLRequest(url: URL(string: "\(base)/schedule")!)
+        req.setValue(token, forHTTPHeaderField: "X-Sora-Token")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard ok(resp) else { throw URLError(.badServerResponse) }
+        let raw = try JSONDecoder().decode(ScheduleList.self, from: data)
+        return (raw.schedules.sorted { ($0.created ?? 0) > ($1.created ?? 0) }, raw.describe ?? [:])
+    }
+
+    /// The servers the bot can post into — the "which Discord" picker.
+    static func guilds(token: String) async throws -> [DiscordGuild] {
+        var req = URLRequest(url: URL(string: "\(base)/schedule/guilds")!)
+        req.setValue(token, forHTTPHeaderField: "X-Sora-Token")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard ok(resp) else { throw URLError(.badServerResponse) }
+        return try JSONDecoder().decode(GuildList.self, from: data).guilds
+    }
+
+    static func channels(token: String, guildID: String) async throws -> [DiscordChannel] {
+        var req = URLRequest(url: URL(string: "\(base)/schedule/guilds/\(guildID)/channels")!)
+        req.setValue(token, forHTTPHeaderField: "X-Sora-Token")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard ok(resp) else { throw URLError(.badServerResponse) }
+        return try JSONDecoder().decode(ChannelList.self, from: data).channels
+    }
+
+    /// Create, toggle, run-now or delete. `action` nil creates.
+    @discardableResult
+    static func scheduleAction(token: String, id: String? = nil, action: String? = nil,
+                               body: [String: Any]? = nil) async throws -> Data {
+        let url: String
+        if let id, let action { url = "\(base)/schedule/\(id)/\(action)" }
+        else { url = "\(base)/schedule" }
+        var req = URLRequest(url: URL(string: url)!)
+        req.httpMethod = "POST"
+        req.setValue(token, forHTTPHeaderField: "X-Sora-Token")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let body { req.httpBody = try JSONSerialization.data(withJSONObject: body) }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard ok(resp) else {
+            // the farm's own words ("quiet hours", "needs a name") are the useful part
+            let msg = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
+            throw NSError(domain: "snora", code: (resp as? HTTPURLResponse)?.statusCode ?? 0,
+                          userInfo: [NSLocalizedDescriptionKey: msg ?? "the farm refused that"])
+        }
+        return data
+    }
+
+    /// one delivery target — a Discord channel, or the app itself
+    static func target(guild: DiscordGuild, channel: DiscordChannel) -> [String: Any] {
+        ["kind": "discord", "guild_id": guild.id, "guild_name": guild.name,
+         "channel_id": channel.id, "channel_name": channel.name]
+    }
+
     /// worker returns 201 Created on success — accept any 2xx
     static func ok(_ resp: URLResponse) -> Bool {
         guard let h = resp as? HTTPURLResponse else { return false }
@@ -158,7 +214,7 @@ enum API {
         switch e.code {
         case .timedOut: return "timed out — this connection is too slow for the photos, try wi-fi"
         case .notConnectedToInternet: return "no internet connection"
-        case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed: return "can't reach the backend"
+        case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed: return "can't reach snail3d.com"
         case .networkConnectionLost: return "connection dropped mid-upload"
         default: return e.localizedDescription
         }
@@ -241,7 +297,7 @@ enum API {
         if let u = videoCache[id], FileManager.default.fileExists(atPath: u.path) {
             return u
         }
-        var req = URLRequest(url: URL(string: "https://YOUR-BACKEND.example.com\(remote)")!)
+        var req = URLRequest(url: URL(string: "https://snail3d.com\(remote)")!)
         req.setValue(token, forHTTPHeaderField: "X-Sora-Token")
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let h = resp as? HTTPURLResponse, h.statusCode == 200 else {
