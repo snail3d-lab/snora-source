@@ -387,11 +387,11 @@ struct ScheduleEditView: View {
             "targets": targets,
         ]
         do {
+            // create first — if it fails the original schedule is still there
+            _ = try await API.scheduleAction(token: token, body: body)
             if let s = existing {
-                // edits go through the same create door (the farm replaces the record)
                 _ = try await API.scheduleAction(token: token, id: s.id, action: "delete")
             }
-            _ = try await API.scheduleAction(token: token, body: body)
             await onDone()
             dismiss()
         } catch {
