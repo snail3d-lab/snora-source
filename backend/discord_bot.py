@@ -683,8 +683,25 @@ def craft(ask, has_photo, has_voice=False, guild_id=None, user_id=None, facts=""
         # no plan (or an off-grid one) — honour a length the member named rather
         # than defaulting to 3s
         duration = explicit_duration(ask) or 3
-    if spoken_words(prompt) > max(4, round(duration * 2.2)) and duration < 15:
-        duration = 15 if duration > 8 else 10 if duration > 5 else 8  # make room for the line
+    # A line the clip cannot speak is a HARD 400 at the farm — the member sees an
+    # error instead of a video. Get under the budget here, and never ship a plan
+    # the farm is about to reject: honour a NAMED length first, then grow the clip
+    # step by step until the dialogue fits. 15s is the ceiling.
+    want = explicit_duration(ask)
+    grid = sorted(DURATIONS)
+    for _ in range(len(grid)):
+        if duration >= 15 or spoken_words(prompt) <= max(4, round(duration * 2.2)):
+            break
+        # stay ON the allowed grid: a 6s clip is not renderable, so an off-grid
+        # duration would be coerced back to 5s at the farm and rejected again
+        nxt = max([d for d in grid if d > duration], default=15)
+        duration = max(want, nxt) if want and want > duration else nxt
+    # Last gate: the farm 400s an over-budget line at the door, which reads to the
+    # member as "no video". If even 15s cannot hold it, say so in plain words
+    # instead of queueing a job that is guaranteed to bounce.
+    if spoken_words(prompt) > max(4, round(duration * 2.2)):
+        return {"error": f"That line is {spoken_words(prompt)} words — 15s (the longest "
+                         "clip) fits about 33 spoken words. Shorten the line and send it again."}
     img_key = plan.get("image") if plan.get("image") in LIB_KEYS else None
     aspect = (plan.get("aspect") if plan.get("aspect") in ASPECTS or
               plan.get("aspect") == "auto" else DEFAULT_ASPECT)
@@ -992,6 +1009,8 @@ class SnoraClient(discord.Client):
                                           "Try again in a sec.")
         if plan.get("reject"):
             return await ack.edit(content=f"🚫 {plan['reject']}")
+        if plan.get("error"):
+            return await ack.edit(content=f"⚠️ {plan['error']}")
         if voice and not imgs and not plan.get("image"):
             return await ack.edit(
                 content="🎙️ A voice needs a face to ride on — send a photo with it, or name "
