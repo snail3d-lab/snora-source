@@ -2662,17 +2662,47 @@ def _recover_orphans():
     """On startup: any job stuck in 'rendering' belongs to a service that died
     mid-render. Kill orphaned vpipe render subprocesses and requeue the jobs."""
     import signal
+    # MEASURED 2026-10-02: killing the orphan and starting the renderer in the
+    # SAME instant deadlocks the new process — it loads the whole model, then
+    # sits at 0.0% CPU forever (the Metal device is still held by the dying one).
+    # So SIGTERM, then WAIT for the process to actually go, escalating to SIGKILL
+    # only if it will not. Nothing may render until the GPU is genuinely free.
+    def _alive():
+        pids = []
+        try:
+            out = subprocess.run(["pgrep", "-f",
+                                  "Helpers/vpipe --launch pipelines/minimax-h3-"],
+                                 capture_output=True, text=True, timeout=10)
+            pids = [int(p) for p in out.stdout.split() if p.strip()]
+        except Exception:
+            pass
+        return pids
     try:
-        out = subprocess.run(["pgrep", "-f",
-            "Helpers/vpipe --launch pipelines/minimax-h3-"],
-            capture_output=True, text=True, timeout=10)
-        pids = [p for p in out.stdout.split() if p.strip()]
-        for pid in pids:
+        for pid in _alive():
             try:
-                os.kill(int(pid), signal.SIGTERM)
-                print(f"[sora] recovered: killed orphaned vpipe pid {pid}", flush=True)
+                os.kill(pid, signal.SIGTERM)
+                print(f"[sora] recovered: SIGTERM orphaned vpipe pid {pid}", flush=True)
             except (ProcessLookupError, ValueError):
                 pass
+        deadline = time.time() + 30
+        while time.time() < deadline and _alive():
+            time.sleep(0.5)
+        stuck = _alive()
+        for pid in stuck:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                print(f"[sora] recovered: SIGKILL orphaned vpipe pid {pid}", flush=True)
+            except (ProcessLookupError, ValueError):
+                pass
+        if stuck:
+            deadline = time.time() + 15
+            while time.time() < deadline and _alive():
+                time.sleep(0.5)
+        left = _alive()
+        print(f"[sora] recovered: GPU clear, no orphaned vpipe"
+              if not left else
+              f"[sora] recovered: {len(left)} vpipe process(es) still alive — "
+              f"renders may hang", flush=True)
     except Exception as e:
         print(f"[sora] orphan scan: {e}", flush=True)
     with _lock:
@@ -2698,7 +2728,10 @@ def main():
     # ones to Discord. Safe to start before the renderer — it only writes queue rows.
     threading.Thread(target=_sched_loop, daemon=True).start()
     if CONFIG["backend"] == "vpipe":
-        threading.Thread(target=_recover_orphans, daemon=True).start()
+        # SYNCHRONOUS on purpose: this waits for any orphaned vpipe to actually
+        # exit. Starting the renderer in the same instant races it into a Metal
+        # deadlock that looks like a permanently stuck render (0.0% CPU).
+        _recover_orphans()
         slots = max(1, int(CONFIG.get("render_slots", 2)))
         for _ in range(slots):
             threading.Thread(target=_renderer_loop, daemon=True).start()
