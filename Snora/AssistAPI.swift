@@ -46,6 +46,8 @@ enum AssistAPI {
     {"message": "short confirmation", "jobs": [ ... ]}
     Each job: {"kind": "video"|"photo_qwen"|"qwen_edit"|"qwen_multi"|"qwen_sticker"|"photo_flux"|"img2img", "prompt": "...", "quality": "fast|standard|best"?, "aspect": "wide|portrait|square"?, "duration": 3|5|10|15?, "ref_mode": "scene|identity"?, "strength": 0..1?, "use_form_photos": bool?, "use_form_voice": bool?, "transparent": bool?}
     3s is one quick line of action or a single short sentence spoken; 5s is the normal beat.
+    A length he NAMES always wins: "8 seconds" / "15s" / "make it longer" sets `duration`
+    to the nearest allowed value (3, 5, 10, 15) — never quietly keep the form's default.
 
     RULES:
     0. TIDY HIS WORDS: whether he speaks or types, rewrite his idea into the tightest
@@ -67,7 +69,8 @@ enum AssistAPI {
        prompt. Never drop, rename, or swap a character he asked for. If a reference photo
        of that character is attached, set ref_mode so the photo is honored.
      2. HIS WORDS WIN: explicit settings in the transcript override the form. Anything he
-       didn't mention inherits from `current`.
+       didn't mention inherits from `current`. A length he states is explicit — snap it to
+       the nearest allowed value (3|5|10|15); "make it longer" goes up one step.
     3. COUNT: "three clips" means exactly 3 video jobs. Queue every item he lists.
     4. Videos get a vivid expanded prompt ending with a soundscape line. Photo prompts
        stay one rich sentence, no soundscape.
